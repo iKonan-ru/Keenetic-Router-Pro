@@ -334,7 +334,7 @@ class KeeneticClient:
 
     async def async_ping_ip(self, ip_address: str, timeout: float = 2.0) -> bool:
         """Ping an IP address using the router's ping functionality.
-        
+
         Returns True if the host is reachable, False otherwise.
         """
         try:
@@ -363,12 +363,12 @@ class KeeneticClient:
             return False
 
     async def async_ping_multiple(
-        self, 
-        ip_addresses: List[str], 
+        self,
+        ip_addresses: List[str],
         timeout: float = 2.0
     ) -> Dict[str, bool]:
         """Ping multiple IP addresses concurrently.
-        
+
         Returns a dict mapping IP address to reachability status.
         """
         if not ip_addresses:
@@ -396,7 +396,7 @@ class KeeneticClient:
         """Return version info"""
         data = await self._rci_get("show/version")
         return data or {}
-    
+
     async def async_get_available_version_info(self) -> Dict[str, Any]:
         """Return version info"""
         data = await self._rci_get("components/check-update")
@@ -404,33 +404,33 @@ class KeeneticClient:
 
     async def async_get_port_info(self, interfaces: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
         """Return physical port information for the main router.
-        
+
         Ports are found in show/interface as top-level entries with type "Port".
         Example keys: "0", "1", "2", "3", "4" with label and link status.
-        
+
         Also checks GigabitEthernet*.port nested dicts as fallback.
         """
         if interfaces is None:
             interfaces = await self.async_get_interfaces()
-        
+
         if not interfaces or not isinstance(interfaces, dict):
             return []
-        
+
         ports: List[Dict[str, Any]] = []
         seen_labels: set = set()
-        
+
         # Method 1: Top-level Port entries (keys like "0", "1", "2", "3", "4")
         for iface_id, iface in interfaces.items():
             if not isinstance(iface, dict):
                 continue
             if iface.get("type") != "Port":
                 continue
-            
+
             label = iface.get("label") or iface.get("interface-name") or iface_id
             if label in seen_labels:
                 continue
             seen_labels.add(label)
-            
+
             entry: Dict[str, Any] = {
                 "label": label,
                 "appearance": iface.get("type"),
@@ -440,24 +440,24 @@ class KeeneticClient:
                 entry["speed"] = iface.get("speed")
                 entry["duplex"] = iface.get("duplex")
             ports.append(entry)
-        
+
         if ports:
             # Sort by label for consistent ordering
             ports.sort(key=lambda p: str(p.get("label", "")))
             _LOGGER.debug("Found %d main router ports from top-level Port entries", len(ports))
             return ports
-        
+
         # Method 2: Nested port dicts inside GigabitEthernet interfaces
         for iface_id, iface in interfaces.items():
             if not isinstance(iface, dict):
                 continue
             if iface.get("type") != "GigabitEthernet":
                 continue
-            
+
             port_data = iface.get("port")
             if not port_data or not isinstance(port_data, dict):
                 continue
-            
+
             # port can be a single dict (GigabitEthernet1) or dict of dicts (GigabitEthernet0)
             if "label" in port_data:
                 # Single port dict
@@ -491,13 +491,13 @@ class KeeneticClient:
                         entry["speed"] = port_val.get("speed")
                         entry["duplex"] = port_val.get("duplex")
                     ports.append(entry)
-        
+
         if ports:
             ports.sort(key=lambda p: str(p.get("label", "")))
             _LOGGER.debug("Found %d main router ports from nested GigabitEthernet port data", len(ports))
         else:
             _LOGGER.warning("No physical ports found for main router")
-        
+
         return ports
 
     async def async_get_interfaces(self) -> Dict[str, Any]:
@@ -507,45 +507,45 @@ class KeeneticClient:
 
     async def async_get_wifi_password(self, interface_id: str) -> str | None:
         """Get WiFi password (PSK) for a specific interface.
-        
+
         Tries multiple API paths since different firmware versions
         store the PSK in different locations.
         """
-        
+
         def _extract_psk(data: Any) -> str | None:
             """Extract PSK from various possible data structures."""
             if not isinstance(data, dict):
                 return None
-            
+
             # Path: authentication.wpa-psk.psk
             auth = data.get("authentication", {})
             if isinstance(auth, dict):
                 wpa_psk = auth.get("wpa-psk", {})
                 if isinstance(wpa_psk, dict) and wpa_psk.get("psk"):
                     return str(wpa_psk["psk"])
-            
+
             # Path: security-level.wpa.psk
             sec = data.get("security-level", {})
             if isinstance(sec, dict):
                 wpa = sec.get("wpa", {})
                 if isinstance(wpa, dict) and wpa.get("psk"):
                     return str(wpa["psk"])
-            
+
             # Path: wpa.psk
             wpa = data.get("wpa", {})
             if isinstance(wpa, dict) and wpa.get("psk"):
                 return str(wpa["psk"])
-            
+
             # Direct key
             if data.get("key"):
                 return str(data["key"])
-            
+
             return None
-        
+
         # Method 1: GET show/interface/{id} - interface status with details
         try:
             data = await self._rci_get(f"show/interface/{interface_id}")
-            _LOGGER.debug("WiFi password Method 1 (show/interface/%s) response keys: %s", 
+            _LOGGER.debug("WiFi password Method 1 (show/interface/%s) response keys: %s",
                          interface_id, list(data.keys()) if isinstance(data, dict) else type(data))
             psk = _extract_psk(data)
             if psk:
@@ -592,7 +592,7 @@ class KeeneticClient:
                 if psk:
                     _LOGGER.debug("WiFi password found via Method 4 for %s", interface_id)
                     return psk
-                    
+
             # Also try matching by SSID across all interfaces
             for iface_id, iface in interfaces.items():
                 if not isinstance(iface, dict):
@@ -607,7 +607,7 @@ class KeeneticClient:
         # Method 5: CLI parse
         try:
             result = await self._rci_parse(f"more interface {interface_id}")
-            _LOGGER.debug("WiFi password Method 5 (CLI) response: %s", 
+            _LOGGER.debug("WiFi password Method 5 (CLI) response: %s",
                          str(result)[:500] if result else "None")
             if result:
                 result_str = str(result)
@@ -621,7 +621,7 @@ class KeeneticClient:
                                 return candidate
         except Exception as err:
             _LOGGER.debug("WiFi password Method 5 failed for %s: %s", interface_id, err)
-        
+
         _LOGGER.warning(
             "Could not retrieve WiFi password for interface %s. "
             "QR code will be generated without password. "
@@ -694,7 +694,7 @@ class KeeneticClient:
                 continue
 
             wg_info = item.get("wireguard") or {}
-            description = item.get("description") or name 
+            description = item.get("description") or name
 
             remote = None
             rx_val = wg_info.get("rxbytes") or item.get("rxbytes")
@@ -895,8 +895,8 @@ class KeeneticClient:
                     vis_name = f"{logical_name} {band_label}"
 
                 net: Dict[str, Any] = {
-                    "id": raw_id,          
-                    "name": vis_name,      
+                    "id": raw_id,
+                    "name": vis_name,
                     "ssid": logical_name,
                     "band": band_label,
                     "enabled": enabled,
@@ -1850,7 +1850,7 @@ class KeeneticClient:
                 rci_info = member.get("rci", {})
 
                 is_connected = (
-                    rci_info.get("errors", 0) == 0 
+                    rci_info.get("errors", 0) == 0
                     and member.get("internet-available", False)
                 )
 
@@ -1875,7 +1875,7 @@ class KeeneticClient:
                     "ip": member.get("ip"),
                     "name": member.get("known-host") or member.get("model") or mac,
                     "model": member.get("model"),
-                    "mode": member.get("mode"), 
+                    "mode": member.get("mode"),
                     "hw_id": member.get("hw_id"),
                     "connected": is_connected,
                     "state": "up" if is_connected else "down",
@@ -1884,7 +1884,7 @@ class KeeneticClient:
                     "memory": system_info.get("memory"),
                     "firmware": member.get("fw"),
                     "firmware_available": member.get("fw-available"),
-                    "associations": member.get("associations", 0), 
+                    "associations": member.get("associations", 0),
                     "rci_errors": rci_info.get("errors", 0),
                     "fqdn": member.get("fqdn"),
                     "port": normalized_ports,
@@ -1921,7 +1921,7 @@ class KeeneticClient:
 
             nodes.append({
                 "id": mac,
-                "cid": None, 
+                "cid": None,
                 "mac": mac,
                 "ip": client.get("ip"),
                 "name": client.get("name") or client.get("hostname") or mac,
@@ -1936,7 +1936,7 @@ class KeeneticClient:
 
     async def async_reboot_mesh_node(self, cid: str) -> None:
         """Reboot a specific mesh/extender node by CID (component ID).
-        
+
         Command format: mws member {cid} reboot
         """
         _LOGGER.warning("Sending reboot command to mesh node cid=%s", cid)
@@ -1948,7 +1948,7 @@ class KeeneticClient:
         self, node_ip: str, node_name: str = "", node_cid: str = ""
     ) -> List[Dict[str, Any]]:
         """Get USB storage info directly from a mesh/extender node.
-        
+
         Mesh member'lar kendi RCI API'larına sahip ve controller ile
         aynı credentials'ı paylaşır. Doğrudan member IP'sine bağlanıp
         POST /rci/system/usb ile USB bilgisini alırız.
@@ -2056,15 +2056,15 @@ class KeeneticClient:
         self, interfaces: Dict[str, Any] | None = None
     ) -> Dict[str, Any]:
         """Get traffic statistics (speed, totals).
-        
+
         Args:
             interfaces: Pre-fetched interfaces data to avoid duplicate API calls.
         """
         stats: Dict[str, Any] = {
-            "download_speed": 0.0,  
-            "upload_speed": 0.0,    
-            "total_rx": 0,          
-            "total_tx": 0,          
+            "download_speed": 0.0,
+            "upload_speed": 0.0,
+            "total_rx": 0,
+            "total_tx": 0,
         }
 
         try:
@@ -2088,32 +2088,32 @@ class KeeneticClient:
 
                 if state == "up" and any(k in name_joined for k in WAN_KEYWORDS):
                     stats["total_rx"] = (
-                        iface.get("rxbytes") or 
-                        iface.get("rx-bytes") or 
-                        iface.get("bytes-rx") or 
-                        iface.get("rx") or 
+                        iface.get("rxbytes") or
+                        iface.get("rx-bytes") or
+                        iface.get("bytes-rx") or
+                        iface.get("rx") or
                         0
                     )
                     stats["total_tx"] = (
-                        iface.get("txbytes") or 
-                        iface.get("tx-bytes") or 
-                        iface.get("bytes-tx") or 
-                        iface.get("tx") or 
+                        iface.get("txbytes") or
+                        iface.get("tx-bytes") or
+                        iface.get("bytes-tx") or
+                        iface.get("tx") or
                         0
                     )
 
                     rx_speed = (
-                        iface.get("rx-speed") or 
-                        iface.get("rxspeed") or 
-                        iface.get("speed-rx") or 
-                        iface.get("rx_rate") or 
+                        iface.get("rx-speed") or
+                        iface.get("rxspeed") or
+                        iface.get("speed-rx") or
+                        iface.get("rx_rate") or
                         0
                     )
                     tx_speed = (
-                        iface.get("tx-speed") or 
-                        iface.get("txspeed") or 
-                        iface.get("speed-tx") or 
-                        iface.get("tx_rate") or 
+                        iface.get("tx-speed") or
+                        iface.get("txspeed") or
+                        iface.get("speed-tx") or
+                        iface.get("tx_rate") or
                         0
                     )
 
@@ -2134,7 +2134,7 @@ class KeeneticClient:
 
     async def async_get_all_interface_stats(self) -> Dict[str, Dict[str, Any]]:
         """Get traffic statistics for all interfaces.
-        
+
         Returns dict mapping interface name to stats (rxbytes, txbytes, etc.)
         """
         interfaces = await self.async_get_interfaces()
@@ -2288,10 +2288,19 @@ class KeeneticClient:
             p = partitions[0]
             if isinstance(p, dict):
                 part0 = p
+        elif isinstance(partitions, dict) and partitions:
+            first = next(iter(partitions.values()))
+            if isinstance(first, dict):
+                part0 = first
 
         total = self._to_int((part0 or {}).get("total")) or self._to_int(media_info.get("size"))
-        free = self._to_int((part0 or {}).get("free"))
-        used = max(total - free, 0) if (total and free is not None) else self._to_int((part0 or {}).get("used"))
+        # Read free as raw value so None (missing) is distinct from 0 (actually empty).
+        free_raw = (part0 or {}).get("free")
+        free = self._to_int(free_raw) if free_raw is not None else None
+        if total and free is not None:
+            used = max(total - free, 0)
+        else:
+            used = self._to_int((part0 or {}).get("used"))
 
         filesystem = (part0 or {}).get("fstype") or media_info.get("fstype") or media_info.get("filesystem")
         label = (part0 or {}).get("label") or media_info.get("label") or media_info.get("product") or dev_id
@@ -2319,7 +2328,7 @@ class KeeneticClient:
             "serial": media_info.get("serial") or (usb_info or {}).get("serial"),
             "total": total,
             "used": used,
-            "free": free,
+            "free": free if free is not None else 0,
             "filesystem": filesystem,
             "state": (part0 or {}).get("state") or media_info.get("state"),
             "type": media_info.get("bus") or "usb",
@@ -2378,7 +2387,7 @@ class KeeneticClient:
 
     async def async_get_client_stats(self) -> Dict[str, Any]:
         """Get connected/disconnected client counts and per-AP stats.
-        
+
         Extender/repeater cihazları client sayısından çıkarılır.
         """
         clients = await self.async_get_clients()
@@ -2402,7 +2411,7 @@ class KeeneticClient:
                     "description": client.get("description"),
                     "http_host": client.get("http-host"),
                 })
-                continue  
+                continue
 
             is_active = False
             if "active" in client:
@@ -2437,7 +2446,7 @@ class KeeneticClient:
         return {
             "connected": connected,
             "disconnected": disconnected,
-            "total": connected + disconnected, 
+            "total": connected + disconnected,
             "per_ap": per_ap,
             "extenders": extenders,
             "extender_count": len(extenders),
@@ -2445,7 +2454,7 @@ class KeeneticClient:
 
     async def async_get_policies(self) -> Dict[str, str]:
         """Get available connection policies.
-        
+
         Returns:
             Dict mapping policy_id to description
             e.g. {"Policy0": "VPN", "Policy1": "Smart Home", ...}
@@ -2469,7 +2478,7 @@ class KeeneticClient:
 
     async def async_get_host_policies(self) -> Dict[str, Dict[str, Any]]:
         """Get policy assignments for all hosts.
-        
+
         Returns:
             Dict mapping MAC to policy info
             e.g. {"aa:bb:cc:dd:ee:ff": {"policy": "Policy1", "access": "permit"}, ...}
@@ -2496,8 +2505,8 @@ class KeeneticClient:
                 mac = str(host.get("mac") or "").lower()
                 if mac:
                     host_policies[mac] = {
-                        "policy": host.get("policy"), 
-                        "access": host.get("access"), 
+                        "policy": host.get("policy"),
+                        "access": host.get("access"),
                     }
 
             return host_policies
@@ -2507,7 +2516,7 @@ class KeeneticClient:
 
     async def async_set_client_policy(self, mac: str, policy: str) -> None:
         """Set connection policy for a client.
-        
+
         Args:
             mac: Client MAC address
             policy: Policy ID (e.g. "Policy0", "Policy1") or "deny"/"default"
@@ -2557,7 +2566,7 @@ class KeeneticClient:
 
             # Проверяем, есть ли обновление (только stable канал)
             has_update = (
-                current and available and 
+                current and available and
                 current != available and
                 data.get("fw-update-sandbox") == "stable"
             )
@@ -2865,7 +2874,7 @@ class KeeneticClient:
 
     async def async_get_update_progress(self) -> Dict[str, Any]:
         """Get current update progress (if in progress).
-        
+
         Returns progress info or empty dict if no update running.
         """
         try:
@@ -2881,10 +2890,10 @@ class KeeneticClient:
             }
         except Exception:
             return {}
-        
+
     async def async_get_ndns_info(self) -> Dict[str, Any]:
         """Get NDNS (Dynamic DNS) information from /rci/show/ndns.
-        
+
         Returns detailed information about NDNS configuration and tunnels.
         Example response includes:
         - name: Hostname
@@ -2898,10 +2907,10 @@ class KeeneticClient:
             data = await self._rci_get("show/ndns")
             if not data:
                 return {}
-            
+
             # Ensure we always return a dict
             result = dict(data) if isinstance(data, dict) else {}
-            
+
             # Parse tunnel information if present
             if "ttp" in result and isinstance(result["ttp"], dict):
                 ttp = result["ttp"]
@@ -2919,10 +2928,10 @@ class KeeneticClient:
                                         pass
                             tunnels.append(tunnel)
                     ttp["tunnel"] = tunnels
-            
+
             _LOGGER.debug("NDNS info retrieved: %s", result)
             return result
-            
+
         except Exception as err:
             _LOGGER.debug("Error getting NDNS info: %s", err)
             return {}
