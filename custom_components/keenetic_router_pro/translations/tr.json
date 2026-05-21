@@ -17,7 +17,28 @@
         "title": "İzlenecek Cihazları Seçin",
         "description": "Varlık tespiti için hangi cihazları izlemek istediğinizi seçin. {client_count} cihaz bulundu.",
         "data": {
-          "tracked_clients": "İzlenecek cihazlar"
+          "tracked_clients": "İzlenecek cihazlar",
+          "link_state_fallback": "Ping başarısız olunca router'ın link durumunu yedek olarak kullan (farklı subnet'teki cihazlar için aktive et)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Keenetic Router Pro Kimlik Yenile",
+        "description": "{host} adresindeki router kayıtlı kimlik bilgilerini reddetti. Genellikle bu router yönetici şifresinin değiştirildiği anlamına gelir. Erişimi geri kazanmak için güncel bilgileri girin.",
+        "data": {
+          "username": "Kullanıcı adı",
+          "password": "Şifre"
+        }
+      },
+      "reconfigure_confirm": {
+        "title": "Keenetic Router Pro Yeniden Yapılandır",
+        "description": "Bu Keenetic router'ı için bağlantı parametrelerini değiştirin. Entity geçmişi, otomasyonlar ve dashboard'lar korunur — sadece bağlantı detayları güncellenir.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "username": "Kullanıcı adı",
+          "password": "Şifre",
+          "ssl": "SSL Kullan",
+          "use_challenge_auth": "Challenge Auth Kullan (NDW2)"
         }
       }
     },
@@ -28,7 +49,11 @@
     },
     "abort": {
       "already_configured": "Cihaz zaten yapılandırılmış",
-      "no_clients": "Ağda cihaz bulunamadı"
+      "no_clients": "Ağda cihaz bulunamadı",
+      "reauth_successful": "Kimlik yenileme başarılı",
+      "reauth_unknown_entry": "Yeniden kimlik doğrulanacak entegrasyon kaydı bulunamadı",
+      "reconfigure_successful": "Yeniden yapılandırma başarılı",
+      "reconfigure_unknown_entry": "Yeniden yapılandırılacak entegrasyon kaydı bulunamadı"
     }
   },
   "options": {
@@ -38,7 +63,8 @@
         "description": "Varlık tespiti için hangi cihazları izleyeceğinizi seçin. {client_count} cihaz bulundu.",
         "data": {
           "tracked_clients": "İzlenecek cihazlar",
-          "ping_interval": "Cihaz takibi ping aralığı (saniye)"
+          "ping_interval": "Cihaz takibi ping aralığı (saniye)",
+          "link_state_fallback": "Ping başarısız olunca router'ın link durumunu yedek olarak kullan (farklı subnet'teki cihazlar için önerilir)"
         }
       }
     },
@@ -103,6 +129,12 @@
       "firmware_update": {
         "name": "Yazılım Güncelleme"
       }
+    }
+  },
+  "issues": {
+    "insecure_http": {
+      "title": "{title} için şifrelenmemiş HTTP bağlantısı",
+      "description": "Keenetic Router Pro entegrasyonu {host} adresine düz HTTP üzerinden (SSL kapalı) bağlanıyor. Her sorgulamada router kullanıcı adı, NDW2 challenge yanıtı (veya Basic Auth header'ı) ve oturum çerezi LAN'da şifrelenmemiş olarak iletiliyor. Aynı broadcast alandaki herkes bunları yakalayabilir.\n\nÇözüm:\n1. Router yönetim arayüzünde HTTPS'i etkinleştirin (Sistem Ayarları → Web Konfigüratör → HTTPS'i etkinleştir).\n2. Bu entegrasyonu SSL açık şekilde yeniden yapılandırın (Ayarlar → Cihazlar ve Servisler → Keenetic Router Pro → Yapılandır).\n3. Yeni HTTPS portu eskisinden farklı ise onu da güncelleyin.\n\nLoopback adresleri (127.0.0.1 / localhost) ve SSH tüneli üzerinden gelen hedefler bu uyarıyı tetiklemez. Tam tehdit modeli için SECURITY.md belgesine bakın."
     }
   }
 }

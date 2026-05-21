@@ -17,7 +17,28 @@
         "title": "Select Clients to Track",
         "description": "Select which clients you want to track for presence detection. Found {client_count} clients.",
         "data": {
-          "tracked_clients": "Clients to track"
+          "tracked_clients": "Clients to track",
+          "link_state_fallback": "Use router link state as fallback when ping fails (enable for cross-subnet devices)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Keenetic Router Pro",
+        "description": "The router at {host} rejected the stored credentials. This usually means the router admin password was rotated. Enter the current credentials to restore access.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reconfigure_confirm": {
+        "title": "Reconfigure Keenetic Router Pro",
+        "description": "Change the connection parameters for this Keenetic router. Entity history, automations, and dashboards are preserved — only the connection details are updated.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "username": "Username",
+          "password": "Password",
+          "ssl": "Use SSL",
+          "use_challenge_auth": "Use Challenge Auth (NDW2)"
         }
       }
     },
@@ -28,7 +49,11 @@
     },
     "abort": {
       "already_configured": "Device is already configured",
-      "no_clients": "No clients found on the network"
+      "no_clients": "No clients found on the network",
+      "reauth_successful": "Re-authentication successful",
+      "reauth_unknown_entry": "Could not find the integration entry to re-authenticate",
+      "reconfigure_successful": "Reconfiguration successful",
+      "reconfigure_unknown_entry": "Could not find the integration entry to reconfigure"
     }
   },
   "options": {
@@ -38,7 +63,8 @@
         "description": "Select which clients to track for presence detection. Found {client_count} clients.",
         "data": {
           "tracked_clients": "Clients to track",
-          "ping_interval": "Presence ping interval (seconds)"
+          "ping_interval": "Presence ping interval (seconds)",
+          "link_state_fallback": "Use router link state as fallback when ping fails (recommended for cross-subnet devices)"
         }
       }
     },
@@ -103,6 +129,12 @@
       "firmware_update": {
         "name": "Firmware Update"
       }
+    }
+  },
+  "issues": {
+    "insecure_http": {
+      "title": "Plaintext HTTP connection to {title}",
+      "description": "The Keenetic Router Pro integration is configured to connect to {host} over plaintext HTTP (SSL disabled). On every poll, the router username, the NDW2 challenge response (or Basic Auth header) and the session cookie traverse your LAN unencrypted. Anyone on the same broadcast domain can capture them.\n\nTo fix:\n1. Enable HTTPS on the router admin UI (System Settings → Web Configurator → enable HTTPS).\n2. Reconfigure this integration with SSL enabled (Settings → Devices & Services → Keenetic Router Pro → Configure).\n3. If the new HTTPS port differs from the old one, update it too.\n\nLoopback hosts (127.0.0.1 / localhost) and SSH-tunneled targets do not trigger this warning. See SECURITY.md for the full threat model."
     }
   }
 }
