@@ -31,6 +31,7 @@ from homeassistant.const import (
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import CryptoMapEntity
+from ..utils import safe_float, safe_int
 
 
 class _CryptoMapSensorBase(CryptoMapEntity, SensorEntity):
@@ -119,6 +120,11 @@ class _CryptoMapBytesBase(_CryptoMapSensorBase):
     by ``SensorStateClass.TOTAL_INCREASING`` — HA Statistics treats a
     drop as a reset rather than a negative delta.
     """
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
 
     _attr_device_class = SensorDeviceClass.DATA_SIZE
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -131,16 +137,15 @@ class _CryptoMapBytesBase(_CryptoMapSensorBase):
         cmap = self._cmap
         if cmap is None:
             return None
-        v = cmap.get(self._field)
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
+        return safe_int(cmap.get(self._field))
 
 
 class KeeneticCryptoMapRxBytesSensor(_CryptoMapBytesBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:download"
     _field = "rx_bytes"
 
@@ -154,6 +159,11 @@ class KeeneticCryptoMapRxBytesSensor(_CryptoMapBytesBase):
 
 
 class KeeneticCryptoMapTxBytesSensor(_CryptoMapBytesBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:upload"
     _field = "tx_bytes"
 
@@ -173,6 +183,11 @@ class _CryptoMapThroughputBase(_CryptoMapSensorBase):
     previous tick, with a clamp at zero to absorb counter resets on
     phase-2 rekey.
     """
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
 
     _attr_device_class = SensorDeviceClass.DATA_RATE
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -185,16 +200,15 @@ class _CryptoMapThroughputBase(_CryptoMapSensorBase):
         cmap = self._cmap
         if cmap is None:
             return None
-        v = cmap.get(self._field)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
+        return safe_float(cmap.get(self._field))
 
 
 class KeeneticCryptoMapRxThroughputSensor(_CryptoMapThroughputBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:download-network"
     _field = "rx_throughput"
 
@@ -208,6 +222,11 @@ class KeeneticCryptoMapRxThroughputSensor(_CryptoMapThroughputBase):
 
 
 class KeeneticCryptoMapTxThroughputSensor(_CryptoMapThroughputBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:upload-network"
     _field = "tx_throughput"
 

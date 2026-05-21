@@ -10,6 +10,7 @@ from homeassistant.const import UnitOfTime, EntityCategory
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity, MeshEntity
+from ..utils import clamp_percent, safe_float, safe_int
 
 
 class KeeneticMeshSystemStateSensor(ControllerEntity, SensorEntity):
@@ -107,11 +108,19 @@ class KeeneticMeshSystemStateSensor(ControllerEntity, SensorEntity):
 
 class KeeneticMeshUptimeSensor(MeshEntity, SensorEntity):
     """Mesh node uptime sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_translation_key = "uptime"
     _attr_icon = "mdi:timer-outline"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # TOTAL_INCREASING (not MEASUREMENT): mesh node uptime resets to
+    # zero on extender reboot. Matches router/PPPoE/WireGuard rationale.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator: KeeneticCoordinator, entry: ConfigEntry, node_cid: str) -> None:
         MeshEntity.__init__(self, coordinator, entry.entry_id, entry.title, node_cid)
@@ -126,20 +135,22 @@ class KeeneticMeshUptimeSensor(MeshEntity, SensorEntity):
         return UnitOfTime.SECONDS
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | None:
         node = self._node
         if node:
             uptime = node.get("uptime")
             if uptime not in (None, "", "unknown", "Unknown"):
-                try:
-                    return int(float(uptime))
-                except (TypeError, ValueError):
-                    pass
-        return 0
+                return safe_int(uptime)
+        return None
 
 
 class KeeneticMeshClientsSensor(MeshEntity, SensorEntity):
     """Mesh node active clients sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_translation_key = "mesh_clients"
     _attr_icon = "mdi:account-group"
@@ -213,6 +224,11 @@ class KeeneticMeshLocalIpSensor(MeshEntity, SensorEntity):
 
 class KeeneticMeshCpuLoadSensor(MeshEntity, SensorEntity):
     """Mesh node CPU load sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_translation_key = "cpu_load"
     _attr_native_unit_of_measurement = "%"
@@ -232,17 +248,17 @@ class KeeneticMeshCpuLoadSensor(MeshEntity, SensorEntity):
     def native_value(self) -> float | None:
         node = self._node
         if node:
-            cpuload = node.get("cpuload")
-            if cpuload is not None:
-                try:
-                    return float(cpuload)
-                except (TypeError, ValueError):
-                    pass
+            return safe_float(node.get("cpuload"))
         return None
 
 
 class KeeneticMeshMemorySensor(MeshEntity, SensorEntity):
     """Mesh node memory usage percentage sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_translation_key = "memory_usage"
     _attr_native_unit_of_measurement = "%"
@@ -266,10 +282,10 @@ class KeeneticMeshMemorySensor(MeshEntity, SensorEntity):
             if isinstance(memory, str) and "/" in memory:
                 try:
                     part_used, part_total = memory.split("/", 1)
-                    used = float(part_used)
-                    total = float(part_total)
-                    if total > 0:
-                        return round(used * 100.0 / total, 1)
+                    used = safe_float(part_used)
+                    total = safe_float(part_total)
+                    if used is not None and total is not None and total > 0:
+                        return clamp_percent(round(used * 100.0 / total, 1))
                 except (ValueError, TypeError):
                     pass
         return None

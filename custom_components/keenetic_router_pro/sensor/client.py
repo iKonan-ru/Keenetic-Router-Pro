@@ -11,6 +11,7 @@ from homeassistant.const import UnitOfInformation, UnitOfTime, PERCENTAGE, Entit
 from ..coordinator import KeeneticCoordinator
 from ..entity import ClientEntity
 from ..const import DOMAIN
+from ..utils import safe_float, safe_int
 
 
 class KeeneticClientIpSensor(ClientEntity, SensorEntity):
@@ -120,10 +121,18 @@ class KeeneticClientLinkSensor(ClientEntity, SensorEntity):
 
 class KeeneticClientUptimeSensor(ClientEntity, SensorEntity):
     """Uptime sensor for client."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:timer-outline"
     _attr_device_class = SensorDeviceClass.DURATION
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # TOTAL_INCREASING: client Wi-Fi session uptime resets on re-association,
+    # matches the router/mesh/PPPoE/WireGuard rationale.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
@@ -148,16 +157,13 @@ class KeeneticClientUptimeSensor(ClientEntity, SensorEntity):
         return UnitOfTime.SECONDS
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | None:
         client = self._client
         if client:
             uptime = client.get("uptime")
             if uptime not in (None, "", "unknown", "Unknown"):
-                try:
-                    return int(float(uptime))
-                except (TypeError, ValueError):
-                    pass
-        return 0
+                return safe_int(uptime)
+        return None
 
 
 class KeeneticClientFirstSeenSensor(ClientEntity, SensorEntity):
@@ -192,18 +198,21 @@ class KeeneticClientFirstSeenSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> int:
         client = self._client
-        if client:
-            first_seen = client.get("first-seen")
-            if first_seen not in (None, "", "unknown", "Unknown"):
-                try:
-                    return int(float(first_seen))
-                except (TypeError, ValueError):
-                    pass
-        return 0
+        if not client:
+            return None
+        first_seen = client.get("first-seen")
+        if first_seen in (None, "", "unknown", "Unknown"):
+            return None
+        return safe_int(first_seen)
 
 
 class KeeneticClientLastSeenSensor(ClientEntity, SensorEntity):
     """Last seen seconds ago sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:clock"
     _attr_device_class = SensorDeviceClass.DURATION
@@ -234,18 +243,21 @@ class KeeneticClientLastSeenSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> int:
         client = self._client
-        if client:
-            last_seen = client.get("last-seen")
-            if last_seen not in (None, "", "unknown", "Unknown"):
-                try:
-                    return int(float(last_seen))
-                except (TypeError, ValueError):
-                    pass
-        return 0
+        if not client:
+            return None
+        last_seen = client.get("last-seen")
+        if last_seen in (None, "", "unknown", "Unknown"):
+            return None
+        return safe_int(last_seen)
 
 
 class KeeneticClientRxSensor(ClientEntity, SensorEntity):
     """Received traffic sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:download-network"
     _attr_device_class = SensorDeviceClass.DATA_SIZE
@@ -276,17 +288,21 @@ class KeeneticClientRxSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> float | None:
         client = self._client
-        if client:
-            rxbytes = client.get("rxbytes", 0)
-            try:
-                return round(float(rxbytes) / (1024 ** 3), 2)
-            except (TypeError, ValueError):
-                pass
-        return 0.0
+        if not client:
+            return None
+        bytes_val = safe_float(client.get("rxbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
 
 class KeeneticClientTxSensor(ClientEntity, SensorEntity):
     """Sent traffic sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:upload-network"
     _attr_device_class = SensorDeviceClass.DATA_SIZE
@@ -317,17 +333,21 @@ class KeeneticClientTxSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> float | None:
         client = self._client
-        if client:
-            txbytes = client.get("txbytes", 0)
-            try:
-                return round(float(txbytes) / (1024 ** 3), 2)
-            except (TypeError, ValueError):
-                pass
-        return 0.0
+        if not client:
+            return None
+        bytes_val = safe_float(client.get("txbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
 
 class KeeneticClientSpeedSensor(ClientEntity, SensorEntity):
     """Link speed sensor (Mbps)."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:speedometer"
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -357,14 +377,9 @@ class KeeneticClientSpeedSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         client = self._client
-        if client:
-            speed = client.get("speed")
-            if speed is not None:
-                try:
-                    return int(speed)
-                except (TypeError, ValueError):
-                    pass
-        return None
+        if not client:
+            return None
+        return safe_int(client.get("speed"))
 
 
 class KeeneticClientPortSensor(ClientEntity, SensorEntity):
@@ -402,6 +417,11 @@ class KeeneticClientPortSensor(ClientEntity, SensorEntity):
 
 class KeeneticClientRssiSensor(ClientEntity, SensorEntity):
     """WiFi RSSI (signal strength) sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:wifi"
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
@@ -432,18 +452,18 @@ class KeeneticClientRssiSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         client = self._client
-        if client:
-            rssi = client.get("rssi")
-            if rssi is not None:
-                try:
-                    return int(rssi)
-                except (TypeError, ValueError):
-                    pass
-        return None
+        if not client:
+            return None
+        return safe_int(client.get("rssi"))
 
 
 class KeeneticClientTxRateSensor(ClientEntity, SensorEntity):
     """WiFi transmission rate sensor."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:transmission-tower"
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -473,14 +493,9 @@ class KeeneticClientTxRateSensor(ClientEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         client = self._client
-        if client:
-            txrate = client.get("txrate")
-            if txrate is not None:
-                try:
-                    return int(txrate)
-                except (TypeError, ValueError):
-                    pass
-        return None
+        if not client:
+            return None
+        return safe_int(client.get("txrate"))
     
 class KeeneticClientConnectionTypeSensor(ClientEntity, SensorEntity):
     """Connection type sensor (WiFi 2.4GHz, WiFi 5GHz, Ethernet)."""

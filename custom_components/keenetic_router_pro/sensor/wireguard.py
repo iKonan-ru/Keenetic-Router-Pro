@@ -10,6 +10,7 @@ from homeassistant.const import UnitOfInformation, UnitOfTime, EntityCategory
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity
+from ..utils import safe_float, safe_int
 
 
 class _BaseWgSensor(ControllerEntity, SensorEntity):
@@ -41,6 +42,10 @@ class _BaseWgSensor(ControllerEntity, SensorEntity):
 class KeeneticWgUptimeSensor(_BaseWgSensor):
     """WireGuard tunnel uptime sensor."""
     _attr_has_entity_name = True
+    # TOTAL_INCREASING (not the MEASUREMENT inherited from _BaseWgSensor):
+    # WireGuard tunnel uptime resets on handshake re-establishment.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
 
     @property
     def unique_id(self) -> str:
@@ -55,16 +60,15 @@ class KeeneticWgUptimeSensor(_BaseWgSensor):
         return UnitOfTime.SECONDS
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | None:
         for key in ("uptime", "uptime_sec", "uptime_seconds"):
             value = self._wg.get(key)
             if value in (None, "", "unknown", "Unknown"):
                 continue
-            try:
-                return int(float(value))
-            except (TypeError, ValueError):
-                continue
-        return 0
+            parsed = safe_int(value)
+            if parsed is not None:
+                return parsed
+        return None
 
 
 class KeeneticWgRxSensor(_BaseWgSensor):
@@ -89,11 +93,9 @@ class KeeneticWgRxSensor(_BaseWgSensor):
             value = self._wg.get(key)
             if value in (None, ""):
                 continue
-            try:
-                bytes_val = float(value)
+            bytes_val = safe_float(value)
+            if bytes_val is not None:
                 return round(bytes_val / (1024 * 1024), 2)
-            except (TypeError, ValueError):
-                continue
         return None
 
 
@@ -119,9 +121,7 @@ class KeeneticWgTxSensor(_BaseWgSensor):
             value = self._wg.get(key)
             if value in (None, ""):
                 continue
-            try:
-                bytes_val = float(value)
+            bytes_val = safe_float(value)
+            if bytes_val is not None:
                 return round(bytes_val / (1024 * 1024), 2)
-            except (TypeError, ValueError):
-                continue
         return None

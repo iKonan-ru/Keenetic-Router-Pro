@@ -10,6 +10,7 @@ from homeassistant.const import PERCENTAGE, UnitOfTime, EntityCategory
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity, MeshEntity
+from ..utils import clamp_percent, safe_float, safe_int
 
 
 class KeeneticCpuLoadSensor(ControllerEntity, SensorEntity):
@@ -36,7 +37,12 @@ class KeeneticCpuLoadSensor(ControllerEntity, SensorEntity):
         sys = self.coordinator.data.get("system", {}) or {}
         for key in ("cpu_load", "cpuload", "cpu", "cpu-utilization"):
             if key in sys:
-                return float(sys[key])
+                # safe_float returns None for NaN/inf/non-coercible so
+                # a malformed router payload cannot poison the recorder's
+                # long-term-statistics table for this sensor.
+                value = safe_float(sys[key])
+                if value is not None:
+                    return value
         return None
 
 
@@ -69,23 +75,24 @@ class KeeneticMemoryUsageSensor(ControllerEntity, SensorEntity):
         if isinstance(mem, str) and "/" in mem:
             try:
                 part_used, part_total = mem.split("/", 1)
-                used = float(part_used)
-                total = float(part_total)
-                if total > 0:
-                    return round(used * 100.0 / total, 1)
+                used = safe_float(part_used)
+                total = safe_float(part_total)
+                if used is not None and total is not None and total > 0:
+                    # Clamp to [0,100] — transient memfree>memtotal
+                    # firmware payloads produce e.g. -1.7% otherwise.
+                    return clamp_percent(round(used * 100.0 / total, 1))
             except (ValueError, TypeError):
                 pass
 
         if isinstance(memtotal, (int, float)) and isinstance(memfree, (int, float)) and memtotal > 0:
             used = memtotal - memfree
-            return round(used * 100.0 / memtotal, 1)
+            return clamp_percent(round(used * 100.0 / memtotal, 1))
 
         for key in ("mem_used_percent", "memory_usage", "memusage"):
             if key in sys:
-                try:
-                    return float(sys[key])
-                except (TypeError, ValueError):
-                    continue
+                value = clamp_percent(sys[key])
+                if value is not None:
+                    return value
 
         return None
 
@@ -96,7 +103,14 @@ class KeeneticUptimeSensor(ControllerEntity, SensorEntity):
     _attr_translation_key = "uptime"
     _attr_icon = "mdi:timer-outline"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # TOTAL_INCREASING (not MEASUREMENT): uptime is a monotonic counter
+    # that resets to zero on reboot. Declaring it MEASUREMENT made HA's
+    # recorder treat every poll as a separate gauge value and store a
+    # weeks-long sawtooth in the long-term-statistics table. With
+    # TOTAL_INCREASING the recorder collapses each "session" into a
+    # single increasing curve and resets cleanly on reboot.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator: KeeneticCoordinator, entry: ConfigEntry) -> None:
         ControllerEntity.__init__(self, coordinator, entry.entry_id, entry.title)
@@ -110,7 +124,7 @@ class KeeneticUptimeSensor(ControllerEntity, SensorEntity):
         return UnitOfTime.SECONDS
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | None:
         sys = self.coordinator.data.get("system", {}) or {}
         candidates = []
 
@@ -127,12 +141,13 @@ class KeeneticUptimeSensor(ControllerEntity, SensorEntity):
         for value in candidates:
             if value in (None, "", "unknown", "Unknown"):
                 continue
-            try:
-                return int(float(value))
-            except (TypeError, ValueError):
-                continue
+            # safe_int rejects NaN/inf in addition to the
+            # TypeError/ValueError cases the old code caught.
+            parsed = safe_int(value)
+            if parsed is not None:
+                return parsed
 
-        return 0
+        return None
 
 
 class KeeneticFirmwareVersionSensor(ControllerEntity, SensorEntity):
@@ -241,12 +256,7 @@ class KeeneticMeshCpuLoadSensor(MeshEntity, SensorEntity):
     def native_value(self) -> float | None:
         node = self._node
         if node:
-            cpuload = node.get("cpuload")
-            if cpuload is not None:
-                try:
-                    return float(cpuload)
-                except (TypeError, ValueError):
-                    pass
+            return safe_float(node.get("cpuload"))
         return None
 
 
@@ -275,10 +285,10 @@ class KeeneticMeshMemorySensor(MeshEntity, SensorEntity):
             if isinstance(memory, str) and "/" in memory:
                 try:
                     part_used, part_total = memory.split("/", 1)
-                    used = float(part_used)
-                    total = float(part_total)
-                    if total > 0:
-                        return round(used * 100.0 / total, 1)
+                    used = safe_float(part_used)
+                    total = safe_float(part_total)
+                    if used is not None and total is not None and total > 0:
+                        return clamp_percent(round(used * 100.0 / total, 1))
                 except (ValueError, TypeError):
                     pass
         return None

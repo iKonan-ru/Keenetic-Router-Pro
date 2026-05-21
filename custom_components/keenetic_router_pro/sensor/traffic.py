@@ -10,6 +10,7 @@ from homeassistant.const import UnitOfInformation, EntityCategory
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity
+from ..utils import safe_float
 
 
 class KeeneticInterfaceRxSensor(ControllerEntity, SensorEntity):
@@ -45,10 +46,10 @@ class KeeneticInterfaceRxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        rxbytes = iface_stats.get("rxbytes", 0)
-        if rxbytes:
-            return round(float(rxbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("rxbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -98,10 +99,10 @@ class KeeneticInterfaceTxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        txbytes = iface_stats.get("txbytes", 0)
-        if txbytes:
-            return round(float(txbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("txbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -144,10 +145,10 @@ class KeeneticLanRxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        rxbytes = iface_stats.get("rxbytes", 0)
-        if rxbytes:
-            return round(float(rxbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("rxbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
 
 class KeeneticLanTxSensor(ControllerEntity, SensorEntity):
@@ -176,10 +177,10 @@ class KeeneticLanTxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        txbytes = iface_stats.get("txbytes", 0)
-        if txbytes:
-            return round(float(txbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("txbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
 
 class KeeneticWanRxSensor(ControllerEntity, SensorEntity):
@@ -208,10 +209,10 @@ class KeeneticWanRxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        rxbytes = iface_stats.get("rxbytes", 0)
-        if rxbytes:
-            return round(float(rxbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("rxbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)
 
 
 class KeeneticWanTxSensor(ControllerEntity, SensorEntity):
@@ -240,7 +241,7 @@ class KeeneticWanTxSensor(ControllerEntity, SensorEntity):
     def native_value(self) -> float | None:
         stats = self.coordinator.data.get("interface_stats", {})
         iface_stats = stats.get(self._iface_name, {})
-        txbytes = iface_stats.get("txbytes", 0)
-        if txbytes:
-            return round(float(txbytes) / (1024 ** 3), 2)
-        return 0.0
+        bytes_val = safe_float(iface_stats.get("txbytes", 0))
+        if bytes_val is None:
+            return None
+        return round(bytes_val / (1024 ** 3), 2)

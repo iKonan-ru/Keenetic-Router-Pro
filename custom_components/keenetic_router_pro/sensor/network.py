@@ -15,6 +15,7 @@ from homeassistant.const import UnitOfTime, UnitOfInformation, UnitOfDataRate, E
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity, WanEntity
+from ..utils import safe_float, safe_int
 
 
 class KeeneticWanStatusSensor(ControllerEntity, SensorEntity):
@@ -97,7 +98,11 @@ class KeeneticPppoeUptimeSensor(ControllerEntity, SensorEntity):
     _attr_translation_key = "pppoe_uptime"
     _attr_icon = "mdi:timer-outline"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # TOTAL_INCREASING (not MEASUREMENT): PPPoE uptime is a monotonic
+    # counter that resets to zero on every redial. See the rationale
+    # on KeeneticUptimeSensor.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator: KeeneticCoordinator, entry: ConfigEntry) -> None:
         ControllerEntity.__init__(self, coordinator, entry.entry_id, entry.title)
@@ -111,15 +116,12 @@ class KeeneticPppoeUptimeSensor(ControllerEntity, SensorEntity):
         return UnitOfTime.SECONDS
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | None:
         wan = self.coordinator.data.get("wan_status", {})
         uptime = wan.get("uptime")
         if uptime in (None, "", "unknown", "Unknown"):
-            return 0
-        try:
-            return int(float(uptime))
-        except (TypeError, ValueError):
-            return 0
+            return None
+        return safe_int(uptime)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -397,9 +399,18 @@ class KeeneticWanPublicIpSensor(_WanSensorBase):
 
 class KeeneticWanUptimeSensor(_WanSensorBase):
     """Session uptime for the WAN, in seconds."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:timer-outline"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_device_class = SensorDeviceClass.DURATION
+    # TOTAL_INCREASING: same rationale as router/PPPoE uptime — WAN
+    # session uptime resets every time the uplink redials.
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 0
 
     @property
     def unique_id(self) -> str:
@@ -421,14 +432,16 @@ class KeeneticWanUptimeSensor(_WanSensorBase):
         up = wan.get("uptime")
         if up in (None, "", "unknown"):
             return None
-        try:
-            return int(float(up))
-        except (TypeError, ValueError):
-            return None
+        return safe_int(up)
 
 
 class _WanBytesBase(_WanSensorBase):
     """Shared RX/TX byte counter base."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_device_class = SensorDeviceClass.DATA_SIZE
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_native_unit_of_measurement = UnitOfInformation.BYTES
@@ -440,16 +453,17 @@ class _WanBytesBase(_WanSensorBase):
         wan = self._wan
         if not wan:
             return None
-        v = wan.get(self._field)
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
+        # safe_int collapses NaN/inf + the TypeError/ValueError cases
+        # the old code caught into one None-return path.
+        return safe_int(wan.get(self._field))
 
 
 class KeeneticWanRxBytesSensor(_WanBytesBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:download"
     _field = "rx_bytes"
 
@@ -463,6 +477,11 @@ class KeeneticWanRxBytesSensor(_WanBytesBase):
 
 
 class KeeneticWanTxBytesSensor(_WanBytesBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:upload"
     _field = "tx_bytes"
 
@@ -476,6 +495,11 @@ class KeeneticWanTxBytesSensor(_WanBytesBase):
 
 
 class _WanThroughputBase(_WanSensorBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_device_class = SensorDeviceClass.DATA_RATE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfDataRate.BYTES_PER_SECOND
@@ -487,16 +511,15 @@ class _WanThroughputBase(_WanSensorBase):
         wan = self._wan
         if not wan:
             return None
-        v = wan.get(self._field)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
+        return safe_float(wan.get(self._field))
 
 
 class KeeneticWanRxThroughputSensor(_WanThroughputBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:download-network"
     _field = "rx_throughput"
 
@@ -510,6 +533,11 @@ class KeeneticWanRxThroughputSensor(_WanThroughputBase):
 
 
 class KeeneticWanTxThroughputSensor(_WanThroughputBase):
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_icon = "mdi:upload-network"
     _field = "tx_throughput"
 

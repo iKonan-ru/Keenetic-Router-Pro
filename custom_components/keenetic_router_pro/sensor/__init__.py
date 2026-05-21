@@ -93,6 +93,14 @@ from .crypto import (
     KeeneticCryptoMapRxThroughputSensor,
     KeeneticCryptoMapTxThroughputSensor,
 )
+from .dns import (
+    KeeneticDnsProxyStatusSensor,
+    KeeneticDnsProxyFailedRequestsSensor,
+)
+from .ipsec import (
+    KeeneticIpsecViciStatusSensor,
+    KeeneticIpsecViciOutOfMemorySensor,
+)
 
 
 async def async_setup_entry(
@@ -276,6 +284,17 @@ async def async_setup_entry(
             continue
         known_cmap_names.add(cmap_name)
         entities.extend(_crypto_map_sensor_set(cmap_name))
+
+    # DNS proxy + IPsec VICI diagnostics (Sprint 4).
+    # These are controller-level singletons — there's exactly one DNS
+    # proxy and one IPsec subsystem per router. Each sensor gates its
+    # own ``available`` on the underlying coordinator data being
+    # present, so on routers without DoH / IPsec they simply render as
+    # unavailable rather than disappearing.
+    entities.append(KeeneticDnsProxyStatusSensor(coordinator, entry))
+    entities.append(KeeneticDnsProxyFailedRequestsSensor(coordinator, entry))
+    entities.append(KeeneticIpsecViciStatusSensor(coordinator, entry))
+    entities.append(KeeneticIpsecViciOutOfMemorySensor(coordinator, entry))
 
     async_add_entities(entities)
 

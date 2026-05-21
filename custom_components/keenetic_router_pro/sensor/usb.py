@@ -96,6 +96,11 @@ class KeeneticUsbStorageSensor(ControllerEntity, SensorEntity):
 
 class KeeneticMeshUsbStorageSensor(MeshEntity, SensorEntity):
     """USB storage sensor - on mesh node."""
+    # Opt out of the base-class fingerprint dedup: this sensor's
+    # native_value reads from a field that the parent entity's
+    # _FINGERPRINT_IGNORE set marks as 'volatile / no state write'.
+    # Without the override, the sensor would never tick.
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
     _attr_has_entity_name = True
     _attr_icon = "mdi:usb-flash-drive"
     _attr_state_class = SensorStateClass.MEASUREMENT
