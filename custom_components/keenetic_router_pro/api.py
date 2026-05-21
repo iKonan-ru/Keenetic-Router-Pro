@@ -683,9 +683,28 @@ class KeeneticClient:
 
             return None
 
+        # Track endpoint-missing (404 / "not found") errors across the
+        # methods that actually hit the router over the network. We
+        # used to (Sprint 6) cache + return None right inside Method 1's
+        # exception handler — that turned a single-endpoint 404 into a
+        # permanent "no password" verdict for the interface, which is
+        # exactly the regression that produced QR codes encoded as
+        # ``T:nopass`` after v1.8.0 shipped on firmwares where
+        # ``show/interface/<id>`` 404s for an AccessPoint that
+        # ``interface/<id>`` / CLI parse happily expose. The cache is
+        # now populated only at the END of the function, after every
+        # method has been exhausted — and only if every network method
+        # we attempted reported the endpoint as missing. That preserves
+        # the issue #49 spam fix for *genuinely* non-existent
+        # interfaces while letting real APs fall through to the next
+        # method.
+        network_methods_attempted = 0
+        network_methods_missing = 0
+
         # Method 1: GET show/interface/{id} - interface status with details
         try:
             data = await self._rci_get(f"show/interface/{interface_id}")
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 1 (show/interface/%s) response keys: %s",
                          interface_id, list(data.keys()) if isinstance(data, dict) else type(data))
             psk = _extract_psk(data)
@@ -693,38 +712,43 @@ class KeeneticClient:
                 _LOGGER.debug("WiFi password found via Method 1 for %s", interface_id)
                 return psk
         except KeeneticApiError as err:
-            # If Method 1 (the canonical interface-status endpoint)
-            # returns 404, this interface genuinely doesn't exist on
-            # the router. Cache the result, skip the remaining 4
-            # methods (which would each produce another router-log
-            # error), and return None for this tick.
+            network_methods_attempted += 1
             if _is_endpoint_missing(err):
+                network_methods_missing += 1
                 _LOGGER.debug(
-                    "Interface %s does not exist on this router — "
-                    "caching as missing to avoid log spam",
+                    "WiFi password Method 1 endpoint-missing for %s "
+                    "— falling through to Methods 2-5",
                     interface_id,
                 )
-                self._missing_interface_paths.add(interface_id)
-                return None
-            _LOGGER.debug("WiFi password Method 1 failed for %s: %s", interface_id, err)
+            else:
+                _LOGGER.debug("WiFi password Method 1 failed for %s: %s", interface_id, err)
         except Exception as err:  # noqa: BLE001
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 1 failed for %s: %s", interface_id, err)
 
         # Method 2: GET interface/{id} - running configuration
         try:
             data = await self._rci_get(f"interface/{interface_id}")
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 2 (interface/%s) response keys: %s",
                          interface_id, list(data.keys()) if isinstance(data, dict) else type(data))
             psk = _extract_psk(data)
             if psk:
                 _LOGGER.debug("WiFi password found via Method 2 for %s", interface_id)
                 return psk
+        except KeeneticApiError as err:
+            network_methods_attempted += 1
+            if _is_endpoint_missing(err):
+                network_methods_missing += 1
+            _LOGGER.debug("WiFi password Method 2 failed for %s: %s", interface_id, err)
         except Exception as err:
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 2 failed for %s: %s", interface_id, err)
 
         # Method 3: POST show/interface with nested query
         try:
             data = await self._rci_post("show/interface", {interface_id: {}})
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 3 (POST show/interface) response keys: %s",
                          list(data.keys()) if isinstance(data, dict) else type(data))
             if isinstance(data, dict):
@@ -734,7 +758,13 @@ class KeeneticClient:
                 if psk:
                     _LOGGER.debug("WiFi password found via Method 3 for %s", interface_id)
                     return psk
+        except KeeneticApiError as err:
+            network_methods_attempted += 1
+            if _is_endpoint_missing(err):
+                network_methods_missing += 1
+            _LOGGER.debug("WiFi password Method 3 failed for %s: %s", interface_id, err)
         except Exception as err:
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 3 failed for %s: %s", interface_id, err)
 
         # Method 4: Look in the already-fetched full interfaces dict
@@ -764,6 +794,7 @@ class KeeneticClient:
         try:
             safe_iface = _validate_cli_arg(interface_id, "interface id")
             result = await self._rci_parse(f"more interface {safe_iface}")
+            network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 5 (CLI) response: %s",
                          str(result)[:500] if result else "None")
             if result:
@@ -776,8 +807,38 @@ class KeeneticClient:
                             candidate = parts[-1].strip('"').strip("'")
                             if len(candidate) >= 8:
                                 return candidate
-        except Exception as err:
+        except KeeneticApiError as err:
+            network_methods_attempted += 1
+            if _is_endpoint_missing(err):
+                network_methods_missing += 1
             _LOGGER.debug("WiFi password Method 5 failed for %s: %s", interface_id, err)
+        except Exception as err:
+            network_methods_attempted += 1
+            _LOGGER.debug("WiFi password Method 5 failed for %s: %s", interface_id, err)
+
+        # Post-exhaustion cache populate (issue #49 spam fix, properly
+        # gated). If every network endpoint we tried reported the
+        # interface as missing, this AP genuinely doesn't exist on the
+        # router — typically a phantom WifiMaster0/AccessPoint1 on a
+        # firmware that surfaces the slot in the interface list but
+        # has no actual configuration for it. Cache so subsequent
+        # ticks short-circuit at the top instead of generating 4
+        # router-log errors per tick.
+        #
+        # We require at least 2 methods to have actually reported
+        # missing — a single network blip during one method shouldn't
+        # be enough to blacklist a real interface, and the in-memory
+        # Method 4 is intentionally excluded from the count.
+        if (
+            network_methods_attempted >= 2
+            and network_methods_missing == network_methods_attempted
+        ):
+            _LOGGER.debug(
+                "Interface %s reported missing by all %d network methods "
+                "— caching to suppress per-tick log spam",
+                interface_id, network_methods_missing,
+            )
+            self._missing_interface_paths.add(interface_id)
 
         _LOGGER.warning(
             "Could not retrieve WiFi password for interface %s. "
