@@ -6,7 +6,14 @@ from homeassistant.components.device_tracker import SourceType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from .const import DOMAIN, DATA_COORDINATOR, DATA_PING_COORDINATOR, CONF_TRACKED_CLIENTS
+from .const import (
+    DOMAIN,
+    DATA_COORDINATOR,
+    DATA_PING_COORDINATOR,
+    CONF_TRACKED_CLIENTS,
+    CONF_LINK_STATE_FALLBACK,
+    DEFAULT_LINK_STATE_FALLBACK,
+)
 from .coordinator import KeeneticCoordinator, KeeneticPingCoordinator
 from .entity import ClientEntity
 
@@ -26,6 +33,18 @@ async def async_setup_entry(
 
     if not tracked_clients:
         return
+
+    # Issue #48: read the link-state-fallback option once at setup.
+    # Resolution chain: options (set via Options flow) -> data (set
+    # at initial setup form) -> hard-coded default in const.py. The
+    # tracker uses this to decide whether router-reported link state
+    # acts as a backup signal when ICMP fails. Options-flow changes
+    # trigger an integration reload, which re-runs this setup, so we
+    # don't need to subscribe to live option changes here.
+    link_state_fallback = entry.options.get(
+        CONF_LINK_STATE_FALLBACK,
+        entry.data.get(CONF_LINK_STATE_FALLBACK, DEFAULT_LINK_STATE_FALLBACK),
+    )
 
     seen_macs: set[str] = set()
 
@@ -48,6 +67,7 @@ async def async_setup_entry(
                 mac=mac,
                 label=label,
                 initial_ip=client_info.get("ip"),
+                link_state_fallback=link_state_fallback,
             )
         )
 
@@ -68,6 +88,7 @@ class KeeneticClientTracker(ClientEntity, ScannerEntity):
         mac: str,
         label: str,
         initial_ip: str | None = None,
+        link_state_fallback: bool = DEFAULT_LINK_STATE_FALLBACK,
     ) -> None:
         ClientEntity.__init__(
             self, 
@@ -84,16 +105,27 @@ class KeeneticClientTracker(ClientEntity, ScannerEntity):
         self._mac = mac.lower()
         self._label = label
         self._initial_ip = initial_ip
+        # Issue #48: when ICMP fails, fall back to the router's own
+        # link-state report. Catches devices that exist on the LAN but
+        # are unreachable from HA due to routing / firewall (e.g.,
+        # ESP32 on an isolated sub-LAN). Configurable via the options
+        # flow; default is True because it strictly improves the
+        # cross-subnet case without changing behaviour for users on a
+        # flat LAN (the fallback only triggers AFTER ICMP fails).
+        self._link_state_fallback = link_state_fallback
         self._attr_name = label
 
     async def async_added_to_hass(self) -> None:
+        # super().async_added_to_hass() reaches CoordinatorEntity which
+        # already registers ``self._handle_coordinator_update`` against
+        # ``self.coordinator`` (== self._main_coordinator) via
+        # ``self.async_on_remove(coordinator.async_add_listener(...))``.
+        # Adding it again here would fire two state writes per
+        # coordinator tick — that was the 1.7.32 fork bug. Only
+        # register the ping coordinator listener, which super() knows
+        # nothing about.
         await super().async_added_to_hass()
-        
-        self.async_on_remove(
-            self._main_coordinator.async_add_listener(
-                self._handle_coordinator_update
-            )
-        )
+
         # Ping coordinator'ı da dinle — her ping cycle'da state güncellensin
         self.async_on_remove(
             self._ping_coordinator.async_add_listener(
@@ -173,32 +205,102 @@ class KeeneticClientTracker(ClientEntity, ScannerEntity):
         name_lower = name.lower()
         return any(kw in name_lower for kw in ("apple", "iphone", "ipad"))
 
+    def _router_says_connected(self) -> bool:
+        """Return True if the router's client table says we're online.
+
+        Used as a fallback signal when ICMP fails. Both ``link=up`` and
+        ``active=true`` are accepted because Keenetic firmwares disagree
+        on which field is authoritative for cross-subnet hosts. Either
+        is sufficient — we OR them, not AND.
+        """
+        client = self._client_from_main
+        if not client:
+            return False
+        link = str(client.get("link") or "").lower()
+        if link == "up":
+            return True
+        active = client.get("active")
+        if isinstance(active, bool):
+            return active
+        if isinstance(active, str):
+            return active.lower() in ("true", "yes", "1", "up", "online")
+        return bool(active)
+
     @property
     def is_connected(self) -> bool:
         if self._is_apple_device:
+            # Apple devices sleep aggressively and stop answering ICMP
+            # while otherwise online — link-state is the only reliable
+            # signal for them. Pre-existing behaviour, kept verbatim.
             client = self._client_from_main
             if client:
                 return str(client.get("link", "")).lower() == "up"
             return False
-        else:
-            ping_results = self._ping_coordinator.data or {}
-            return ping_results.get(self._mac, False) 
+
+        # Non-Apple devices: ICMP is the primary signal. If a device
+        # answers ICMP, it's definitively online — no need to consult
+        # the router.
+        ping_results = self._ping_coordinator.data or {}
+        if ping_results.get(self._mac, False):
+            return True
+
+        # ICMP failed. If the user has the link-state-fallback option
+        # enabled (default ON), use the router's view as a secondary
+        # signal. This catches the cross-subnet scenario from issue
+        # #48: an ESP32 on 192.168.3.0/24 that HA can't reach via
+        # ICMP but the router sees as link=up.
+        #
+        # Failure mode to be aware of: stale router entries (device
+        # truly disconnected but link=up hasn't expired yet) will
+        # produce a brief false-positive "home" reading. In practice
+        # Keenetic updates link state promptly on disconnect, so this
+        # window is small (seconds, not minutes).
+        if self._link_state_fallback and self._router_says_connected():
+            return True
+
+        return False
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         client = self._client_from_main
         ping_results = self._ping_coordinator.data or {}
-        
+
+        # Build a human-readable "why are we home/away" attribute so the
+        # operator can debug border cases (especially cross-subnet
+        # devices where the answer comes from the fallback rather than
+        # ICMP). ``presence_source`` is one of:
+        #   "link_state" — Apple device, only link consulted
+        #   "ping"       — ICMP succeeded, conclusive
+        #   "router_link"— ICMP failed, router fallback engaged
+        #   "icmp_only"  — ICMP failed, fallback disabled → away
+        #   "unreachable"— ICMP failed, router also reports down
         if self._is_apple_device:
-            client_link = (self._client_from_main or {}).get("link", "unknown")
+            client_link = (client or {}).get("link", "unknown")
             tracking_info: dict[str, Any] = {
                 "tracking_method": "link_state",
+                "presence_source": "link_state",
                 "link_status": client_link,
             }
         else:
+            ping_ok = bool(ping_results.get(self._mac, False))
+            router_ok = self._router_says_connected()
+            if ping_ok:
+                presence_source = "ping"
+            elif self._link_state_fallback and router_ok:
+                presence_source = "router_link"
+            elif router_ok:
+                # Router says up but the user disabled the fallback —
+                # we report away. Surface the conflict so it's visible.
+                presence_source = "icmp_only"
+            else:
+                presence_source = "unreachable"
             tracking_info = {
                 "tracking_method": "ping",
-                "ping_status": "reachable" if ping_results.get(self._mac, False) else "unreachable",
+                "presence_source": presence_source,
+                "ping_status": "reachable" if ping_ok else "unreachable",
+                "router_link_status": (client or {}).get("link", "unknown"),
+                "router_active": (client or {}).get("active"),
+                "link_state_fallback_enabled": self._link_state_fallback,
             }
 
         attrs: dict[str, Any] = {

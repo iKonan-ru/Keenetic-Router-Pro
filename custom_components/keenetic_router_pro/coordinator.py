@@ -101,6 +101,8 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             interface_stats,
             ping_check_status,
             crypto_maps,
+            dns_proxy,
+            ipsec_diagnostics,
         ) = await asyncio.gather(
             _bounded(self.client.async_get_system_info()),
             _bounded(self.client.async_get_current_version_info()),
@@ -115,6 +117,13 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _bounded(self.client.async_get_all_interface_stats()),
             _bounded(self.client.async_get_ping_check_status()),
             _bounded(self.client.async_get_crypto_maps()),
+            # New in Sprint 4 — DNS proxy + IPsec VICI log diagnostics.
+            # Both fetches are best-effort and silent: routers without
+            # DoH support / IPsec component return empty dicts, the
+            # capability cache stops them being polled again, and
+            # absent endpoints must not produce per-tick warnings.
+            _bounded(self.client.async_get_dns_proxy_status()),
+            _bounded(self.client.async_get_ipsec_diagnostics()),
             return_exceptions=True,
         )
  
@@ -130,6 +139,11 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usb_storage = _ok("usb_storage", usb_storage, [])
         interface_stats = _ok("interface_stats", interface_stats, {})
         ping_check_status = _ok("ping_check_status", ping_check_status, {})
+        # Silent: routers without DoH or IPsec components return empty.
+        dns_proxy = _ok("dns_proxy", dns_proxy, {}, silent=True)
+        ipsec_diagnostics = _ok(
+            "ipsec_diagnostics", ipsec_diagnostics, {}, silent=True
+        )
         # Crypto maps: not every router/firmware has the IPsec component,
         # so this endpoint may be unavailable. Mark the fetch as silent
         # so an absent endpoint doesn't produce a warning on every tick —
@@ -432,6 +446,42 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         new_macs = current_macs - previous_macs
  
+        # ---------- O(1) lookup indexes ----------
+        # Sensors / device trackers / switches all need to find "their"
+        # row (by MAC for clients, by id for WANs, by cid for mesh
+        # nodes) inside every coordinator tick. Without an index each
+        # entity walks the full list every tick — on a network with
+        # N clients and N entities per client this is O(N²) per tick.
+        # Building the index once here and re-using it from the
+        # entity-base lookup properties makes that O(N).
+        #
+        # Indexes are built defensively (skip non-dicts, skip rows
+        # missing the key) so a single malformed row from the router
+        # can't take down the whole index.
+        clients_by_mac: dict[str, dict[str, Any]] = {}
+        for c in clients:
+            if not isinstance(c, dict):
+                continue
+            mac = str(c.get("mac") or "").lower()
+            if mac:
+                clients_by_mac[mac] = c
+
+        wan_by_id: dict[str, dict[str, Any]] = {}
+        for w in wan_interfaces:
+            if not isinstance(w, dict):
+                continue
+            wan_id = w.get("id")
+            if wan_id:
+                wan_by_id[str(wan_id)] = w
+
+        mesh_nodes_by_cid: dict[str, dict[str, Any]] = {}
+        for n in mesh_nodes:
+            if not isinstance(n, dict):
+                continue
+            cid = n.get("cid") or n.get("id")
+            if cid:
+                mesh_nodes_by_cid[str(cid)] = n
+
         return {
             "system": merged_system,
             "traffic_stats": traffic_stats,
@@ -441,9 +491,12 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "wireguard": wireguard,
             "vpn_tunnels": vpn_tunnels,
             "clients": clients,
+            "clients_by_mac": clients_by_mac,
             "wan_status": wan_status,
             "wan_interfaces": wan_interfaces,
+            "wan_by_id": wan_by_id,
             "mesh_nodes": mesh_nodes,
+            "mesh_nodes_by_cid": mesh_nodes_by_cid,
             "interface_stats": interface_stats,
             "client_stats": client_stats,
             "ndns": ndns_info,
@@ -452,6 +505,8 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "port_info": port_info,
             "mesh_usb": mesh_usb,
             "crypto_maps": crypto_maps,
+            "dns_proxy": dns_proxy,
+            "ipsec_diagnostics": ipsec_diagnostics,
             "new_clients": new_macs,
         }
 

@@ -1,6 +1,63 @@
 """Utilities for Keenetic Router Pro integration."""
+import math
 from typing import Any, Dict, Optional
 from .const import DOMAIN
+
+
+def safe_float(value: Any) -> Optional[float]:
+    """Convert ``value`` to a finite float, or return ``None``.
+
+    Router firmware can occasionally emit ``NaN`` (division-by-zero in
+    some sysstat exporter) or ``inf`` (overflow in a malformed
+    counter) for what should be a normal numeric field. If those
+    values reach a sensor declared as ``SensorStateClass.MEASUREMENT``
+    they permanently corrupt HA's long-term-statistics table for that
+    entity — the recorder treats NaN as a real sample and propagates
+    it forward, breaking every dashboard graph that depends on the
+    affected sensor.
+
+    Returning ``None`` for any non-finite or non-coercible input lets
+    affected sensors fall back to "unavailable" for that tick instead,
+    which the recorder skips entirely.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def safe_int(value: Any) -> Optional[int]:
+    """Convert ``value`` to int, rejecting NaN/inf and conversion errors.
+
+    Same rationale as ``safe_float``. Used by integer sensors (uptime,
+    byte counters, packet counts) where the recorder is just as
+    vulnerable to nonsense values.
+    """
+    f = safe_float(value)
+    if f is None:
+        return None
+    return int(f)
+
+
+def clamp_percent(value: Any) -> Optional[float]:
+    """Convert to float and clamp to [0.0, 100.0].
+
+    Transient firmware payloads where ``memfree`` briefly exceeds
+    ``memtotal`` produce negative memory-usage percentages that look
+    like ``-1.7%`` on the dashboard and break LTS aggregations.
+    Clamping at the edges normalises those transients without losing
+    the genuinely-out-of-range NaN/inf signal — those still return
+    ``None``.
+    """
+    f = safe_float(value)
+    if f is None:
+        return None
+    return max(0.0, min(100.0, f))
 
 
 def get_main_device_info(

@@ -11,12 +11,76 @@ import asyncio
 import base64
 import hashlib
 import logging
+import re
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(f"custom_components.{DOMAIN}.api")
 
 RCI_ROOT = "/rci"
+
+# Strict allow-list for any value that is interpolated into a
+# Keenetic `/rci/parse` CLI command (interface names, MAC addresses,
+# crypto-map names, mesh CIDs, policy IDs, ...). Rejects anything that
+# could break out of the single CLI token the caller intended:
+# whitespace, quotes, backslash, shell metas, control characters, and
+# Keenetic's own `\r\n` command separator. Accepted characters cover
+# every legitimate token shape on this firmware family:
+#   * interface ids — "GigabitEthernet0/Vlan35", "WifiMaster1/AccessPoint0"
+#   * MACs         — "aa:bb:cc:dd:ee:ff"
+#   * IPv4/IPv6    — "192.0.2.1", "2001:db8::1"
+#   * policy names — "Policy0", user-defined "Smart Home" (no spaces -> rename)
+#   * crypto maps  — "TEST", "SITE-TO-SITE_HQ"
+_CLI_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/\-]+$")
+
+
+def _validate_cli_arg(value: str, label: str) -> str:
+    """Return a safe Keenetic CLI token or raise on command-injection input.
+
+    Every value that is going to be interpolated into an `/rci/parse`
+    command must go through this gate. The router executes the parsed
+    command as a CLI line, so an unvalidated value containing a space
+    + a second command would run that command too. The allow-list above
+    matches the legitimate token shapes Keenetic uses and rejects
+    everything else.
+    """
+    if value is None:
+        raise KeeneticApiError(f"Empty {label}")
+    raw = str(value)
+    candidate = raw.strip()
+    if not candidate:
+        raise KeeneticApiError(f"Empty {label}")
+    # A value that needed stripping had a leading/trailing whitespace
+    # character — refuse it rather than silently accepting the stripped
+    # form, because that is exactly the shape command-injection input
+    # likes to take (" foo ; bad cmd ").
+    if candidate != raw:
+        raise KeeneticApiError(f"Unsafe {label}")
+    if not _CLI_TOKEN_RE.fullmatch(candidate):
+        raise KeeneticApiError(f"Unsafe {label}")
+    return candidate
+
+
+def _is_endpoint_missing(err: BaseException) -> bool:
+    """Return True if ``err`` looks like a "router doesn't have this endpoint".
+
+    Two shapes we treat as equivalent to "feature absent":
+
+    1. HTTP 404 from ``_request`` — wrapped in a ``KeeneticApiError``
+       whose message contains ``"HTTP error 404"``.
+    2. The router's RCI "not found" string returned by ``/rci/parse``
+       or some show endpoints when the feature module isn't loaded.
+
+    Anything else (5xx, timeouts, malformed JSON, transient connection
+    errors) is a real fault, not a missing feature, and must NOT
+    suppress future calls.
+    """
+    msg = str(err).lower()
+    if "404" in msg:
+        return True
+    if "not found" in msg:
+        return True
+    return False
 
 
 class KeeneticApiError(Exception):
@@ -54,11 +118,60 @@ class KeeneticClient:
         self._auth_header: Optional[Dict[str, str]] = None
         self._authenticated: bool = False
 
-        # Mesh/Wi-Fi System (MWS) capability cache:
-        # None  -> unknown (not checked yet)
-        # False -> endpoint missing on this device/firmware (avoid router log spam)
-        # True  -> endpoint works
+        # Capability caches. Each attr starts as ``None`` (unknown), is
+        # flipped to ``False`` the first time the corresponding endpoint
+        # returns 404 / "not found" (and subsequent ticks skip the call
+        # entirely so the router stops logging "not found: <feature>"
+        # every poll), and stays ``True`` once the endpoint has been
+        # observed to work at least once.
         self._mws_member_supported: bool | None = None
+        self._crypto_map_supported: bool | None = None
+        self._ping_check_supported: bool | None = None
+        self._ndns_supported: bool | None = None
+        # Sprint 4 capabilities: DNS proxy diagnostics + IPsec VICI log
+        # parsing. Same None/False/True pattern as the rest — once we
+        # learn the endpoint isn't on this firmware, stop calling it.
+        self._dns_proxy_supported: bool | None = None
+        self._ipsec_diagnostics_supported: bool | None = None
+
+        # Sprint 6 (issue #49): per-interface "doesn't exist on this
+        # router" cache. Populated when `show/interface/<id>` returns
+        # 404 — used to short-circuit subsequent calls into
+        # ``async_get_wifi_password`` for non-existent APs (e.g.
+        # WifiMaster0/AccessPoint1 on a router without Guest Wi-Fi).
+        # Without this cache, every coordinator tick fires 3-4 router
+        # log errors per non-existent AP — pavlozelinskyi observed
+        # 3,900 errors in 1.5 hours from this single bug.
+        self._missing_interface_paths: set[str] = set()
+
+        # Serialise auth refreshes. The coordinator's stage-1 fan-out
+        # fires 13 RCI calls in parallel; if the session expires between
+        # ticks, every one of those calls hits ``_ensure_auth`` at the
+        # same time, each schedules its own challenge handshake, and
+        # they race to overwrite ``_auth_header`` and ``_authenticated``.
+        # The losing handshakes leave the client in an inconsistent
+        # state and the next RCI call observes a spurious 401. The lock
+        # forces refresh to happen exactly once per "expired session"
+        # event regardless of caller concurrency.
+        self._auth_lock: asyncio.Lock = asyncio.Lock()
+
+
+    def __repr__(self) -> str:
+        """Redacted repr — never expose username/password in logs/tracebacks.
+
+        Without this override, a stray ``_LOGGER.debug("client=%s", client)``
+        or a traceback containing the client instance would leak both
+        credentials into ``home-assistant.log``. Host/port/SSL stay
+        visible because those are useful for troubleshooting and not
+        secret.
+        """
+        return (
+            f"KeeneticClient(host={self._host!r}, port={self._port}, "
+            f"ssl={self._ssl}, username='<redacted>', password='<redacted>', "
+            f"challenge_auth={self._use_challenge_auth})"
+        )
+
+    __str__ = __repr__
 
 
     async def async_start(self, session: aiohttp.ClientSession) -> None:
@@ -219,8 +332,26 @@ class KeeneticClient:
         )
 
     async def _ensure_auth(self) -> None:
-        """Ensure we are authenticated before making an RCI call."""
-        if not self._authenticated:
+        """Ensure we are authenticated before making an RCI call.
+
+        Double-checked locking: the fast path (already authenticated)
+        avoids touching the lock at all, so the common case doesn't
+        pay any synchronisation cost. The slow path acquires the lock,
+        re-checks the flag (in case another concurrent caller already
+        re-authenticated while we were waiting), and only then runs
+        the actual handshake.
+
+        Without the lock, the coordinator's 13-way parallel stage-1
+        fetch races each other through ``_async_authenticate`` /
+        ``_async_authenticate_challenge`` and they overwrite each
+        other's ``_auth_header``, leaving the client in an
+        inconsistent state and producing spurious 401s.
+        """
+        if self._authenticated:
+            return
+        async with self._auth_lock:
+            if self._authenticated:
+                return
             if self._use_challenge_auth:
                 await self._async_authenticate_challenge()
             else:
@@ -339,7 +470,8 @@ class KeeneticClient:
         """
         try:
 
-            result = await self._rci_parse(f"ip ping {ip_address} count 1")
+            safe_ip = _validate_cli_arg(ip_address, "ip address")
+            result = await self._rci_parse(f"ip ping {safe_ip} count 1")
 
             if result is None:
                 return False
@@ -511,6 +643,15 @@ class KeeneticClient:
         Tries multiple API paths since different firmware versions
         store the PSK in different locations.
         """
+        # Issue #49 short-circuit: a previous tick learned this
+        # interface doesn't exist on the router (typically
+        # WifiMaster0/AccessPoint1 on routers without Guest Wi-Fi).
+        # Hitting it again would generate 3-4 router-log errors per
+        # tick for no benefit. Cache lives until HA reload — if the
+        # user enables Guest Wi-Fi at runtime they need to reload the
+        # integration to pick it up.
+        if interface_id in self._missing_interface_paths:
+            return None
 
         def _extract_psk(data: Any) -> str | None:
             """Extract PSK from various possible data structures."""
@@ -551,7 +692,22 @@ class KeeneticClient:
             if psk:
                 _LOGGER.debug("WiFi password found via Method 1 for %s", interface_id)
                 return psk
-        except Exception as err:
+        except KeeneticApiError as err:
+            # If Method 1 (the canonical interface-status endpoint)
+            # returns 404, this interface genuinely doesn't exist on
+            # the router. Cache the result, skip the remaining 4
+            # methods (which would each produce another router-log
+            # error), and return None for this tick.
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "Interface %s does not exist on this router — "
+                    "caching as missing to avoid log spam",
+                    interface_id,
+                )
+                self._missing_interface_paths.add(interface_id)
+                return None
+            _LOGGER.debug("WiFi password Method 1 failed for %s: %s", interface_id, err)
+        except Exception as err:  # noqa: BLE001
             _LOGGER.debug("WiFi password Method 1 failed for %s: %s", interface_id, err)
 
         # Method 2: GET interface/{id} - running configuration
@@ -606,7 +762,8 @@ class KeeneticClient:
 
         # Method 5: CLI parse
         try:
-            result = await self._rci_parse(f"more interface {interface_id}")
+            safe_iface = _validate_cli_arg(interface_id, "interface id")
+            result = await self._rci_parse(f"more interface {safe_iface}")
             _LOGGER.debug("WiFi password Method 5 (CLI) response: %s",
                          str(result)[:500] if result else "None")
             if result:
@@ -793,34 +950,97 @@ class KeeneticClient:
             clone["__id"] = raw_id
             ap_items.append(clone)
 
-        groups: Dict[str, Dict[str, Any]] = {}
+        # ===================================================================
+        # Issue #45 grouping fix.
+        #
+        # The old code used ``group_key = group or ssid or base_id``, which
+        # collapsed any two APs sharing a Keenetic bridge ``group`` into a
+        # single logical network — even when their SSIDs were deliberately
+        # different. Reporter's setup:
+        #   * "Chapay"    on WifiMaster0/AccessPoint0 (2.4 GHz)
+        #   * "Chapay_5G" on WifiMaster1/AccessPoint0 (5 GHz)
+        # Both APs share the LAN bridge, so they had the same ``group``.
+        # The old loop set ``g["ssid"] = ssid`` on every iteration — last
+        # write wins — so the 5 GHz SSID overwrote the 2.4 GHz one and the
+        # 2.4 GHz network ended up labelled "Wi-Fi Chapay_5G 2.4 GHz".
+        #
+        # New approach: group by ``(group, ssid)`` when an SSID is present.
+        # Two APs with different SSIDs no longer merge regardless of bridge
+        # membership. Disabled APs (no SSID in the payload) get attached
+        # afterwards to a partner with the same ``group`` only if the
+        # partnership is unambiguous (exactly one logical network in that
+        # bridge); otherwise the orphan AP stands alone with a fallback
+        # display name. This preserves the original "disabled 2.4 GHz
+        # partner inherits the real SSID from the enabled 5 GHz partner"
+        # behaviour for genuine dual-band same-SSID setups.
+        # ===================================================================
+
+        # Pass 1: APs that broadcast a real SSID get keyed by (group, ssid).
+        groups: Dict[tuple, Dict[str, Any]] = {}
+        orphan_aps: List[Dict[str, Any]] = []  # APs with empty SSID
         for item in ap_items:
             raw_id = item["__id"]
             ssid = (item.get("ssid") or "").strip()
             group = str(item.get("group") or "").strip()
             base_id = raw_id.split("/")[0]
 
-            group_key = group or ssid or base_id
+            if not ssid:
+                # Defer — Pass 2 decides whether to attach to a
+                # partner or keep as standalone.
+                orphan_aps.append(item)
+                continue
+
+            # When a group is missing we fall back to the SSID itself
+            # (so SSID-only routers still work) and finally the base
+            # interface id (so a router that exposes APs with neither
+            # field still produces *some* entry per AP).
+            group_key: tuple = (group or "", ssid) if (group or ssid) else ("", base_id)
 
             g = groups.setdefault(
                 group_key,
                 {
-                    "ssid": "",
+                    "ssid": ssid,
                     "group": group,
                     "aps": [],
                 },
             )
-
-            # A real broadcast SSID from any AP in the group always wins.
-            # This matters because Keenetic omits the `ssid` field on
-            # disabled APs: on dual-band networks the 2.4 GHz AP may come
-            # first with no SSID, and if we let a bridge-label fallback
-            # latch in here, we would never pick up the real SSID from
-            # the 5 GHz AP that arrives later.
-            if ssid:
-                g["ssid"] = ssid
-
+            # All APs reaching this branch share the same SSID already,
+            # so assignment is idempotent — no last-write-wins risk.
+            g["ssid"] = ssid
             g["aps"].append(item)
+
+        # Pass 2: place orphan (no-SSID) APs.
+        # Build an index from group -> list of logical networks that
+        # already live in that group.
+        group_to_networks: Dict[str, List[Dict[str, Any]]] = {}
+        for (grp, _ssid), g in groups.items():
+            if grp:
+                group_to_networks.setdefault(grp, []).append(g)
+
+        for item in orphan_aps:
+            raw_id = item["__id"]
+            group = str(item.get("group") or "").strip()
+            base_id = raw_id.split("/")[0]
+            networks_in_group = group_to_networks.get(group, [])
+
+            if group and len(networks_in_group) == 1:
+                # Exactly one logical network in this bridge — the
+                # orphan is unambiguously its disabled partner band.
+                # Attach so the SSID is inherited correctly. This is
+                # the dual-band-same-SSID disabled-partner case the
+                # original code was trying to handle.
+                networks_in_group[0]["aps"].append(item)
+            else:
+                # Either no group or multiple logical networks share
+                # the group — partnership is ambiguous. Keep this AP
+                # as its own entry with a synthetic key; bridge label
+                # / base id will be used for display in the next loop.
+                synthetic_key = ("__orphan__", raw_id)
+                groups[synthetic_key] = {
+                    "ssid": "",
+                    "group": group,
+                    "aps": [item],
+                }
 
         # Second pass: any group that still has no real SSID (e.g. every
         # AP in the group is disabled and the firmware stripped the field
@@ -922,7 +1142,8 @@ class KeeneticClient:
 
     async def async_set_wifi_enabled(self, interface_name: str, enabled: bool) -> None:
         """Enable or disable a Wi-Fi interface via RCI parse."""
-        cmd = f"interface {interface_name} {'up' if enabled else 'down'}"
+        safe = _validate_cli_arg(interface_name, "interface name")
+        cmd = f"interface {safe} {'up' if enabled else 'down'}"
         _LOGGER.debug("Set Wi-Fi %s enabled=%s via: %s", interface_name, enabled, cmd)
         await self._rci_parse(cmd)
 
@@ -937,7 +1158,8 @@ class KeeneticClient:
 
     async def async_set_interface_enabled(self, interface_name: str, enabled: bool) -> None:
         """Enable or disable any interface via RCI 'interface X up/down'."""
-        cmd = f"interface {interface_name} {'up' if enabled else 'down'}"
+        safe = _validate_cli_arg(interface_name, "interface name")
+        cmd = f"interface {safe} {'up' if enabled else 'down'}"
         _LOGGER.debug(
             "Set interface %s enabled=%s via: %s",
             interface_name,
@@ -1404,7 +1626,29 @@ class KeeneticClient:
         the aggregate status is "fail" if any profile is failing (matches
         how Keenetic itself treats the WAN as unusable for routing).
         """
-        data = await self._rci_get("show/ping-check") or {}
+        # Capability gate: once we learn this firmware doesn't expose
+        # show/ping-check (older models, custom builds, IPsec-only
+        # routers), stop hitting it on every coordinator tick — the
+        # router otherwise spams its own log with "not found: ping-check"
+        # at ~6/minute on the default poll interval.
+        if self._ping_check_supported is False:
+            return {}
+
+        try:
+            data = await self._rci_get("show/ping-check") or {}
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "show/ping-check not supported on this router, "
+                    "caching as absent"
+                )
+                self._ping_check_supported = False
+                return {}
+            raise
+
+        # First successful response — pin capability so we never re-test.
+        self._ping_check_supported = True
+
         raw_profiles = data.get("pingcheck") or []
         if not isinstance(raw_profiles, list):
             return {}
@@ -1635,15 +1879,39 @@ class KeeneticClient:
               }
             }
         """
+        # Capability gate: routers without the IPsec component never
+        # expose show/crypto/map and answer 404 every call. Cache the
+        # answer the first time we learn it.
+        if self._crypto_map_supported is False:
+            return {}
+
         try:
             data = await self._rci_get("show/crypto/map") or {}
-        except Exception as err:
-            # Endpoint may not exist on older firmwares or on routers
-            # without the IPsec component installed. Debug-log and
-            # return empty — the coordinator's _ok helper will keep
-            # this out of the warning aggregation.
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "show/crypto/map not supported on this router, "
+                    "caching as absent"
+                )
+                self._crypto_map_supported = False
+                return {}
+            # Real transport / auth / 5xx error — re-raise so the
+            # coordinator's per-tick warning aggregator sees it.
+            _LOGGER.debug("show/crypto/map unavailable: %s", err)
+            raise
+        except asyncio.CancelledError:
+            # Never swallow shutdown — HA reload depends on this
+            # propagating up through the coordinator.
+            raise
+        except Exception as err:  # noqa: BLE001
+            # Keep the original best-effort behaviour for truly weird
+            # router responses (malformed JSON, etc.) so a single odd
+            # firmware doesn't break the integration entirely.
             _LOGGER.debug("show/crypto/map unavailable: %s", err)
             return {}
+
+        # First successful response — pin capability.
+        self._crypto_map_supported = True
 
         raw_maps = data.get("crypto_map") or {}
         if not isinstance(raw_maps, dict):
@@ -1778,7 +2046,8 @@ class KeeneticClient:
         Home Assistant switch toggle is permanent.
         """
         verb = "enable" if enabled else "no enable"
-        cmd = f"crypto map {name}\n{verb}"
+        safe_name = _validate_cli_arg(name, "crypto map name")
+        cmd = f"crypto map {safe_name}\n{verb}"
         _LOGGER.debug(
             "Set crypto map %s enabled=%s via: %r", name, enabled, cmd
         )
@@ -1941,7 +2210,8 @@ class KeeneticClient:
         """
         _LOGGER.warning("Sending reboot command to mesh node cid=%s", cid)
 
-        cmd = f"mws member {cid} reboot"
+        safe_cid = _validate_cli_arg(cid, "mesh node cid")
+        cmd = f"mws member {safe_cid} reboot"
         await self._rci_parse(cmd)
 
     async def async_get_mesh_node_usb(
@@ -2413,6 +2683,15 @@ class KeeneticClient:
                 })
                 continue
 
+            # Issue #48: a device is "connected" if EITHER the explicit
+            # ``active`` flag is true OR the L2 ``link`` is up. Treating
+            # these as mutually exclusive (elif) was wrong: cross-subnet
+            # devices (e.g. ESP32 on a routed sub-LAN 192.168.3.0/24
+            # while HA runs in 192.168.1.0/24) frequently come back with
+            # ``active=false`` even though the L2 link is up and the
+            # device is reachable to the router. They were being
+            # counted as disconnected — Connected Devices sensor read
+            # 3 when 5 were actually online. Either signal is sufficient.
             is_active = False
             if "active" in client:
                 value = client.get("active")
@@ -2422,7 +2701,7 @@ class KeeneticClient:
                     is_active = value.lower() in ("true", "yes", "1", "up", "online")
                 else:
                     is_active = bool(value)
-            elif "link" in client:
+            if not is_active and "link" in client:
                 is_active = str(client.get("link") or "").lower() == "up"
 
             if is_active:
@@ -2522,25 +2801,32 @@ class KeeneticClient:
             policy: Policy ID (e.g. "Policy0", "Policy1") or "deny"/"default"
         """
         mac_clean = mac.lower().replace("-", ":")
+        # Every CLI interpolation goes through `_validate_cli_arg` so a
+        # crafted MAC or policy name (e.g. from a Keenetic web UI with
+        # weakened input validation, or from corrupted config) cannot
+        # smuggle in a second CLI command. We validate the normalized
+        # MAC because that's what hits the command line.
+        safe_mac = _validate_cli_arg(mac_clean, "client mac")
 
         if policy.lower() == "deny":
-            cmd = f"ip hotspot host {mac_clean} deny"
+            cmd = f"ip hotspot host {safe_mac} deny"
             _LOGGER.debug("Blocking client %s", mac_clean)
             await self._rci_parse(cmd)
         elif policy.lower() in ("default", "permit", ""):
 
-            cmd = f"no ip hotspot host {mac_clean} policy"
+            cmd = f"no ip hotspot host {safe_mac} policy"
             _LOGGER.debug("Removing policy from client %s", mac_clean)
             await self._rci_parse(cmd)
 
-            cmd = f"ip hotspot host {mac_clean} permit"
+            cmd = f"ip hotspot host {safe_mac} permit"
             await self._rci_parse(cmd)
         else:
             # Önce erişimi aç (deny durumundaysa permit'e çevir)
-            cmd = f"ip hotspot host {mac_clean} permit"
+            cmd = f"ip hotspot host {safe_mac} permit"
             await self._rci_parse(cmd)
 
-            cmd = f"ip hotspot host {mac_clean} policy {policy}"
+            safe_policy = _validate_cli_arg(policy, "policy id")
+            cmd = f"ip hotspot host {safe_mac} policy {safe_policy}"
             _LOGGER.debug("Setting client %s policy to %s", mac_clean, policy)
             await self._rci_parse(cmd)
 
@@ -2903,11 +3189,36 @@ class KeeneticClient:
         - updated: Last update status
         - address/address6: IP addresses
         """
+        # Capability gate: routers without KeenDNS / NDNS enabled
+        # answer 404 every poll. Cache the result once we know.
+        if self._ndns_supported is False:
+            return {}
+
         try:
             data = await self._rci_get("show/ndns")
-            if not data:
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "show/ndns not supported on this router, "
+                    "caching as absent"
+                )
+                self._ndns_supported = False
                 return {}
+            _LOGGER.debug("Error getting NDNS info: %s", err)
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Error getting NDNS info: %s", err)
+            return {}
 
+        if not data:
+            return {}
+
+        # First successful response — pin capability.
+        self._ndns_supported = True
+
+        try:
             # Ensure we always return a dict
             result = dict(data) if isinstance(data, dict) else {}
 
@@ -2929,9 +3240,329 @@ class KeeneticClient:
                             tunnels.append(tunnel)
                     ttp["tunnel"] = tunnels
 
-            _LOGGER.debug("NDNS info retrieved: %s", result)
+            # NDNS payload contains the user's KeenDNS hostname/domain —
+            # log only structural keys instead of the full body so a
+            # raised debug level cannot leak the operator's identity.
+            _LOGGER.debug("NDNS info retrieved (keys=%s)", list(result.keys()))
             return result
 
-        except Exception as err:
-            _LOGGER.debug("Error getting NDNS info: %s", err)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Error parsing NDNS info: %s", err)
             return {}
+
+    # =================== DNS Proxy diagnostics ===================
+
+    @staticmethod
+    def _redact_doh_uri(value: Any) -> str:
+        """Strip path/query/userinfo from a DNS-over-HTTPS upstream URI.
+
+        Personalised DoH endpoints (NextDNS, ControlD, etc.) embed the
+        operator's account ID in the URI path:
+
+            https://dns.nextdns.io/abc123xyz
+
+        Surfacing that path in HA state, attributes, or a diagnostics
+        dump is effectively a credential leak. This helper returns the
+        URI reduced to just ``scheme://host[:port]/`` so the proxy is
+        identifiable but the account ID stays private.
+        """
+        from urllib.parse import urlsplit, urlunsplit
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parts = urlsplit(text)
+        except ValueError:
+            return ""
+        host = parts.hostname or ""
+        try:
+            port = parts.port
+        except ValueError:
+            # Malformed port — strip the URI entirely rather than
+            # propagate something that other code might choke on.
+            return ""
+        if port:
+            host = f"{host}:{port}"
+        if not host:
+            return ""
+        return urlunsplit((parts.scheme or "https", host, "/", "", ""))
+
+    async def async_get_dns_proxy_status(self) -> Dict[str, Any]:
+        """Return a summary of the router's DNS proxy + DoH upstream health.
+
+        Returns a dict shaped like:
+            {
+                "status": "ok" | "degraded" | "down" | "unknown",
+                "proxy_count": int,
+                "doh_server_count": int,
+                "dns_server_count": int,
+                "active_dns_server_count": int,
+                "requests_sent": int,
+                "failed_requests": int,
+                "proxies": [<redacted upstream URI>, ...],
+                "client_path_uses_doh": bool | None,
+            }
+
+        Returns ``{}`` (empty dict) when the router doesn't expose the
+        DNS proxy endpoint (older firmwares, models without DoH
+        support) — the capability is cached so subsequent ticks don't
+        re-poll the missing endpoint.
+        """
+        if self._dns_proxy_supported is False:
+            return {}
+
+        try:
+            data = await self._rci_get("show/dns-proxy") or {}
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "show/dns-proxy not supported, caching as absent"
+                )
+                self._dns_proxy_supported = False
+                return {}
+            _LOGGER.debug("dns-proxy fetch failed: %s", err)
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("dns-proxy fetch unexpected error: %s", err)
+            return {}
+
+        self._dns_proxy_supported = True
+
+        if not isinstance(data, dict):
+            return {}
+
+        # ----- Proxy / upstream enumeration -----
+        # The router can return the upstream list as either a list or
+        # a single dict when only one upstream is configured (firmware
+        # quirk). Normalise to a list of dicts.
+        raw_proxies = data.get("proxy") or data.get("proxies") or []
+        if isinstance(raw_proxies, dict):
+            raw_proxies = [raw_proxies]
+        if not isinstance(raw_proxies, list):
+            raw_proxies = []
+
+        doh_count = 0
+        dns_count = 0
+        active_dns = 0
+        proxy_uris: list[str] = []
+        client_path_uses_doh: bool | None = None
+
+        for proxy in raw_proxies:
+            if not isinstance(proxy, dict):
+                continue
+
+            uri = proxy.get("uri") or proxy.get("url")
+            proto = str(proxy.get("type") or proxy.get("protocol") or "").lower()
+            is_doh = "doh" in proto or (
+                isinstance(uri, str) and uri.lower().startswith("https://")
+            )
+
+            if uri:
+                proxy_uris.append(self._redact_doh_uri(uri))
+
+            if is_doh:
+                doh_count += 1
+            else:
+                dns_count += 1
+                if proxy.get("active") in (True, "true", "yes", 1, "1"):
+                    active_dns += 1
+
+            # The "client path" is the upstream we're actually using for
+            # client DNS queries — if any of them is DoH, the client
+            # path effectively goes through DoH.
+            if is_doh and proxy.get("active") in (True, "true", "yes", 1, "1"):
+                client_path_uses_doh = True
+
+        if doh_count == 0 and client_path_uses_doh is None:
+            client_path_uses_doh = False
+
+        proxy_count = doh_count + dns_count
+
+        # ----- Counters -----
+        stats = data.get("statistics") or data.get("stats") or {}
+        if not isinstance(stats, dict):
+            stats = {}
+        try:
+            requests_sent = int(stats.get("requests-sent")
+                                or stats.get("requests_sent")
+                                or stats.get("sent") or 0)
+        except (TypeError, ValueError):
+            requests_sent = 0
+        try:
+            failed_requests = int(stats.get("requests-failed")
+                                  or stats.get("requests_failed")
+                                  or stats.get("failed") or 0)
+        except (TypeError, ValueError):
+            failed_requests = 0
+
+        # ----- Status rollup -----
+        # ok        -> ≥1 proxy and (DoH active OR ≥1 active DNS)
+        # degraded  -> ≥1 proxy but no active upstream
+        # down      -> 0 proxies configured
+        # unknown   -> couldn't make sense of the payload
+        if proxy_count == 0:
+            status = "down"
+        elif (doh_count > 0 and client_path_uses_doh) or active_dns > 0:
+            status = "ok"
+        else:
+            status = "degraded"
+
+        return {
+            "status": status,
+            "proxy_count": proxy_count,
+            "doh_server_count": doh_count,
+            "dns_server_count": dns_count,
+            "active_dns_server_count": active_dns,
+            "requests_sent": requests_sent,
+            "failed_requests": failed_requests,
+            "proxies": proxy_uris,
+            "client_path_uses_doh": client_path_uses_doh,
+        }
+
+    # =================== IPsec VICI log diagnostics ===================
+
+    async def async_get_ipsec_diagnostics(self) -> Dict[str, Any]:
+        """Scan the router's recent log for IPsec VICI failure markers.
+
+        Specific firmware-bug shape we care about:
+
+            IpSec::Vici::Stats: out of memory
+
+        These messages indicate the strongSwan VICI socket has run out
+        of buffer space and IPsec status queries are dropping silently
+        — tunnels stay up but the integration's IPsec sensors stop
+        reflecting reality. Surfacing the recent count gives the user
+        an early warning without forcing them to SSH into the router
+        and grep log files manually.
+
+        Returns ``{}`` when the log endpoint isn't reachable; otherwise
+        a dict shaped like:
+            {
+                "status": "ok" | "warning",
+                "vici_out_of_memory_count": int,
+                "last_vici_out_of_memory": str | None,  # ISO-ish timestamp from log
+                "last_error_code": int | None,
+                "recent_matches": [str, ...],
+                "scanned_log_lines": int,
+                "command": str,
+            }
+        """
+        if self._ipsec_diagnostics_supported is False:
+            return {}
+
+        log_cmd = "show log"
+        try:
+            data = await self._rci_parse(log_cmd)
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                _LOGGER.debug(
+                    "show log unavailable, IPsec VICI diagnostics disabled"
+                )
+                self._ipsec_diagnostics_supported = False
+                return {}
+            _LOGGER.debug("IPsec diagnostics fetch failed: %s", err)
+            return {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("IPsec diagnostics unexpected error: %s", err)
+            return {}
+
+        self._ipsec_diagnostics_supported = True
+
+        # `_rci_parse` returns a heterogeneous structure — strings,
+        # dicts with "message" keys, lists of those, etc. Normalise to
+        # a flat list of log lines.
+        log_lines: list[str] = []
+        if isinstance(data, str):
+            log_lines = data.splitlines()
+        elif isinstance(data, dict):
+            messages = self._extract_log_messages(data)
+            log_lines.extend(messages)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    log_lines.append(item)
+                elif isinstance(item, dict):
+                    log_lines.extend(self._extract_log_messages(item))
+
+        # Cap the scan — old router logs can be megabytes. We only
+        # care about the recent tail.
+        TAIL = 2000
+        if len(log_lines) > TAIL:
+            log_lines = log_lines[-TAIL:]
+
+        recent_matches: list[str] = []
+        last_match: str | None = None
+        last_timestamp: str | None = None
+        last_error_code: int | None = None
+
+        marker = "IpSec::Vici::Stats: out of memory"
+        for line in log_lines:
+            if marker.lower() in line.lower():
+                recent_matches.append(line)
+                last_match = line
+                # Crude timestamp extraction — Keenetic log lines start
+                # with a "YYYY-MM-DD HH:MM:SS" or similar prefix. We
+                # keep the first 19 chars as the best-effort timestamp.
+                if len(line) >= 19:
+                    last_timestamp = line[:19]
+
+        # Look for a trailing "errno=N" or "(error N)" pattern on the
+        # last match to surface the actual error code.
+        if last_match:
+            import re as _re
+            m = _re.search(r"err(?:no)?\s*=?\s*(\d+)", last_match)
+            if m:
+                try:
+                    last_error_code = int(m.group(1))
+                except ValueError:
+                    pass
+
+        status = "warning" if recent_matches else "ok"
+
+        return {
+            "status": status,
+            "vici_out_of_memory_count": len(recent_matches),
+            "last_vici_out_of_memory": last_timestamp,
+            "last_error_code": last_error_code,
+            # Cap the surfaced lines too — log lines can be long and
+            # there's no point putting 100 matches into a state
+            # attribute.
+            "recent_matches": recent_matches[-10:],
+            "scanned_log_lines": len(log_lines),
+            "command": log_cmd,
+        }
+
+    @staticmethod
+    def _extract_log_messages(payload: Dict[str, Any]) -> list[str]:
+        """Flatten a `show log` dict response into individual lines.
+
+        Keenetic firmware versions disagree on the response shape:
+        some return ``{"log": [{"message": "..."}, ...]}``, others
+        ``{"message": "..."}`` for a single line, others a string-keyed
+        nested dict. Walk all of them defensively.
+        """
+        lines: list[str] = []
+        log = payload.get("log")
+        if isinstance(log, list):
+            for entry in log:
+                if isinstance(entry, dict):
+                    msg = entry.get("message") or entry.get("msg")
+                    if isinstance(msg, str):
+                        lines.append(msg)
+                elif isinstance(entry, str):
+                    lines.append(entry)
+        elif isinstance(log, dict):
+            msg = log.get("message") or log.get("msg")
+            if isinstance(msg, str):
+                lines.append(msg)
+        # Top-level message field (single-line responses)
+        top = payload.get("message")
+        if isinstance(top, str):
+            lines.append(top)
+        return lines

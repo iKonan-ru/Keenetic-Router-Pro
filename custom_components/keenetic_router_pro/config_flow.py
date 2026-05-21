@@ -17,11 +17,21 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 from homeassistant.helpers.device_registry import format_mac
 
 import logging
+
+# Masked password input — uses HA's password selector so the field
+# renders as dots in the UI on every config-flow step (initial setup,
+# the SSDP-discovered confirm step, and any future re-auth /
+# reconfigure flow). Without this the password is keyed in plaintext
+# and is trivially captured by shoulder-surfing or a stray screenshot.
+_PASSWORD_SELECTOR = selector.TextSelector(
+    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+)
 
 from .api import KeeneticClient, KeeneticAuthError, KeeneticApiError
 from .const import (
@@ -34,6 +44,8 @@ from .const import (
     DEFAULT_PING_INTERVAL,
     MIN_PING_INTERVAL,
     MAX_PING_INTERVAL,
+    CONF_LINK_STATE_FALLBACK,
+    DEFAULT_LINK_STATE_FALLBACK,
 )
 
 _LOGGER = logging.getLogger(f"custom_components.{DOMAIN}.config_flow")
@@ -44,7 +56,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_HOST, default="192.168.1.1"): str,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
         vol.Required(CONF_USERNAME, default="admin"): str,
-        vol.Required(CONF_PASSWORD): str,
+        vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
         vol.Optional(CONF_SSL, default=DEFAULT_SSL): bool,
         vol.Optional(CONF_USE_CHALLENGE_AUTH, default=False): bool,
     }
@@ -209,7 +221,7 @@ class KeeneticRouterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_HOST, default=default_host): str,
                     vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
                     vol.Required(CONF_USERNAME, default="admin"): str,
-                    vol.Required(CONF_PASSWORD): str,
+                    vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
                     vol.Optional(CONF_SSL, default=DEFAULT_SSL): bool,
                     vol.Optional(CONF_USE_CHALLENGE_AUTH, default=False): bool,
                 }
@@ -235,11 +247,28 @@ class KeeneticRouterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 client for client in self._available_clients
                 if client["mac"] in selected_macs
             ]
-            
+
+            # Issue #48: persist the link-state-fallback choice from
+            # the initial setup form. Default is False — users with
+            # devices on isolated sub-LANs opt-in here at setup time
+            # (or later via the Options flow). Stored under
+            # ``entry.data`` so it survives even if the user never
+            # opens Options; the tracker resolves via the standard
+            # options-overrides-data chain.
+            link_state_fallback = bool(
+                user_input.get(
+                    CONF_LINK_STATE_FALLBACK, DEFAULT_LINK_STATE_FALLBACK
+                )
+            )
+
             _LOGGER.debug("Creating entry with title: %s", self._title)
             return self.async_create_entry(
                 title=self._title,
-                data={**self._user_input, CONF_TRACKED_CLIENTS: tracked_clients},
+                data={
+                    **self._user_input,
+                    CONF_TRACKED_CLIENTS: tracked_clients,
+                    CONF_LINK_STATE_FALLBACK: link_state_fallback,
+                },
             )
         
         # Prepare client options
@@ -260,11 +289,229 @@ class KeeneticRouterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {
                     vol.Optional("tracked_clients", default=[]): cv.multi_select(client_options),
+                    # Issue #48: surface the cross-subnet fallback toggle
+                    # here at initial setup so users with isolated
+                    # sub-LANs (or routed LAN segments) don't have to
+                    # learn about it from Options. Default OFF —
+                    # see const.py for why.
+                    vol.Optional(
+                        CONF_LINK_STATE_FALLBACK,
+                        default=DEFAULT_LINK_STATE_FALLBACK,
+                    ): bool,
                 }
             ),
             description_placeholders={
                 "client_count": str(len(client_options)),
             },
+        )
+
+    # ----- Shared connection test helper -----
+    async def _async_try_connect(
+        self, candidate: dict[str, Any]
+    ) -> str | None:
+        """Verify credentials by attempting an actual API session.
+
+        Returns ``None`` on success, otherwise an error key that
+        matches one of the ``errors`` strings in the translations
+        (``invalid_auth`` / ``cannot_connect`` / ``unknown``).
+
+        Used by reauth and reconfigure to validate user input
+        *before* persisting it to the config entry — we never want
+        to overwrite a working entry's credentials with values that
+        don't connect.
+        """
+        try:
+            session = async_get_clientsession(self.hass)
+            client = KeeneticClient(
+                host=candidate[CONF_HOST],
+                username=candidate[CONF_USERNAME],
+                password=candidate[CONF_PASSWORD],
+                port=candidate.get(CONF_PORT, DEFAULT_PORT),
+                ssl=candidate.get(CONF_SSL, DEFAULT_SSL),
+                use_challenge_auth=candidate.get(CONF_USE_CHALLENGE_AUTH, False),
+            )
+            await client.async_start(session)
+            return None
+        except KeeneticAuthError as err:
+            _LOGGER.debug("Auth test failed: %s", err)
+            return "invalid_auth"
+        except KeeneticApiError as err:
+            _LOGGER.debug("Connection test failed: %s", err)
+            return "cannot_connect"
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Unexpected error during connection test")
+            return "unknown"
+
+    # ====================================================================
+    # Reauth flow — triggered automatically by HA when the integration
+    # raises ConfigEntryAuthFailed (typically because the router
+    # password changed). Shows a focused form with just username +
+    # password; host/port/ssl/challenge are preserved from the
+    # existing entry, so the user only types what actually changed.
+    # ====================================================================
+    async def async_step_reauth(
+        self, entry_data: dict[str, Any]
+    ) -> FlowResult:
+        """Entry point — HA hands us the existing entry data."""
+        self._reauth_entry_data = dict(entry_data)
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show the credential-update form and validate the new values."""
+        errors: dict[str, str] = {}
+        existing = self._reauth_entry_data
+
+        if user_input is not None:
+            # Build a full candidate dict by merging the new
+            # credentials onto the existing entry data. That way the
+            # connection test uses the right host/port/ssl/challenge
+            # even though the user only re-entered username/password.
+            candidate = {
+                **existing,
+                CONF_USERNAME: user_input[CONF_USERNAME],
+                CONF_PASSWORD: user_input[CONF_PASSWORD],
+            }
+            err = await self._async_try_connect(candidate)
+            if err is None:
+                # Modern HA helper (≥ 2024.5): merges new data, triggers
+                # a reload of the entry, and aborts this flow — replaces
+                # the older `async_update_entry()` + `async_abort()`
+                # pair which sometimes left users running with stale
+                # credentials until they manually reloaded.
+                entry = self.hass.config_entries.async_get_entry(
+                    self.context["entry_id"]
+                )
+                if entry is None:
+                    # Shouldn't happen in a reauth context, but bail
+                    # gracefully rather than crash if HA's flow state
+                    # has been garbage-collected.
+                    return self.async_abort(reason="reauth_unknown_entry")
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={
+                        CONF_USERNAME: user_input[CONF_USERNAME],
+                        CONF_PASSWORD: user_input[CONF_PASSWORD],
+                    },
+                )
+            errors["base"] = err
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USERNAME,
+                        default=existing.get(CONF_USERNAME, "admin"),
+                    ): str,
+                    # No `default` on the password — pre-filling a
+                    # password field is both a UX anti-pattern (user
+                    # might submit unchanged value by accident) and a
+                    # mild security smell (the masked value still gets
+                    # serialised back to the frontend). User retypes.
+                    vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
+                }
+            ),
+            description_placeholders={
+                "host": existing.get(CONF_HOST, ""),
+            },
+            errors=errors,
+        )
+
+    # ====================================================================
+    # Reconfigure flow — triggered manually from the integration card
+    # ("Configure" → "Reconfigure"). Lets the user change host / port /
+    # SSL / challenge / credentials on an existing entry without
+    # deleting it (which would lose entity history, automations
+    # referencing entity_ids, dashboard cards, etc).
+    # ====================================================================
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Entry point — pull the entry being reconfigured from context."""
+        entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
+        )
+        if entry is None:
+            return self.async_abort(reason="reconfigure_unknown_entry")
+        self._reconfigure_entry_data = dict(entry.data)
+        return await self.async_step_reconfigure_confirm()
+
+    async def async_step_reconfigure_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show the full connection form pre-filled with current values."""
+        errors: dict[str, str] = {}
+        existing = self._reconfigure_entry_data
+
+        if user_input is not None:
+            # Reconfigure replaces the connection fields wholesale.
+            # Tracked-client list, ping interval, and any other
+            # options stay untouched because they live in
+            # ``entry.options``, not ``entry.data``.
+            candidate = {
+                **existing,
+                CONF_HOST: user_input[CONF_HOST],
+                CONF_PORT: user_input[CONF_PORT],
+                CONF_USERNAME: user_input[CONF_USERNAME],
+                CONF_PASSWORD: user_input[CONF_PASSWORD],
+                CONF_SSL: user_input[CONF_SSL],
+                CONF_USE_CHALLENGE_AUTH: user_input.get(
+                    CONF_USE_CHALLENGE_AUTH, False
+                ),
+            }
+            err = await self._async_try_connect(candidate)
+            if err is None:
+                entry = self.hass.config_entries.async_get_entry(
+                    self.context["entry_id"]
+                )
+                if entry is None:
+                    return self.async_abort(reason="reconfigure_unknown_entry")
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={
+                        CONF_HOST: user_input[CONF_HOST],
+                        CONF_PORT: user_input[CONF_PORT],
+                        CONF_USERNAME: user_input[CONF_USERNAME],
+                        CONF_PASSWORD: user_input[CONF_PASSWORD],
+                        CONF_SSL: user_input[CONF_SSL],
+                        CONF_USE_CHALLENGE_AUTH: user_input.get(
+                            CONF_USE_CHALLENGE_AUTH, False
+                        ),
+                    },
+                )
+            errors["base"] = err
+
+        return self.async_show_form(
+            step_id="reconfigure_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_HOST,
+                        default=existing.get(CONF_HOST, "192.168.1.1"),
+                    ): str,
+                    vol.Optional(
+                        CONF_PORT,
+                        default=existing.get(CONF_PORT, DEFAULT_PORT),
+                    ): int,
+                    vol.Required(
+                        CONF_USERNAME,
+                        default=existing.get(CONF_USERNAME, "admin"),
+                    ): str,
+                    # No default on password — see rationale on reauth.
+                    vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
+                    vol.Optional(
+                        CONF_SSL,
+                        default=existing.get(CONF_SSL, DEFAULT_SSL),
+                    ): bool,
+                    vol.Optional(
+                        CONF_USE_CHALLENGE_AUTH,
+                        default=existing.get(CONF_USE_CHALLENGE_AUTH, False),
+                    ): bool,
+                }
+            ),
+            errors=errors,
         )
 
     @staticmethod
@@ -337,9 +584,19 @@ class KeeneticOptionsFlow(config_entries.OptionsFlow):
                 data=new_data,
             )
             _LOGGER.debug("Updated configuration with new tracked clients: %s", tracked_clients)
+            # Persist BOTH the ping interval AND the link-state-fallback
+            # toggle (issue #48). Both live in entry.options so a change
+            # triggers an integration reload without touching the user's
+            # tracked-client list.
+            link_state_fallback = bool(
+                user_input.get(CONF_LINK_STATE_FALLBACK, DEFAULT_LINK_STATE_FALLBACK)
+            )
             return self.async_create_entry(
                 title="",
-                data={CONF_PING_INTERVAL: ping_interval},
+                data={
+                    CONF_PING_INTERVAL: ping_interval,
+                    CONF_LINK_STATE_FALLBACK: link_state_fallback,
+                },
             )
         
         # Get current tracked clients
@@ -409,6 +666,17 @@ class KeeneticOptionsFlow(config_entries.OptionsFlow):
             self._config_entry.data.get(CONF_PING_INTERVAL, DEFAULT_PING_INTERVAL),
         )
 
+        # Current link-state-fallback setting. Resolved via the same
+        # options-overrides-data chain as ping_interval, so the value
+        # chosen during initial setup shows up as the default when the
+        # user opens Options for the first time.
+        current_link_state_fallback = self._config_entry.options.get(
+            CONF_LINK_STATE_FALLBACK,
+            self._config_entry.data.get(
+                CONF_LINK_STATE_FALLBACK, DEFAULT_LINK_STATE_FALLBACK
+            ),
+        )
+
         # Show form
         return self.async_show_form(
             step_id="init",
@@ -419,6 +687,10 @@ class KeeneticOptionsFlow(config_entries.OptionsFlow):
                         CONF_PING_INTERVAL,
                         default=current_ping_interval,
                     ): vol.All(vol.Coerce(int), vol.Range(min=MIN_PING_INTERVAL, max=MAX_PING_INTERVAL)),
+                    vol.Optional(
+                        CONF_LINK_STATE_FALLBACK,
+                        default=current_link_state_fallback,
+                    ): bool,
                 }
             ),
             description_placeholders={

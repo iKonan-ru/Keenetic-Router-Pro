@@ -1,5 +1,6 @@
 """Base entity classes for Keenetic Router Pro."""
 from typing import Any, Dict, Optional
+from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.device_registry import DeviceInfo
 from .const import DOMAIN
@@ -11,6 +12,74 @@ from .utils import (
     get_wan_device_info,
     get_crypto_map_device_info,
 )
+
+
+def _entity_fingerprint(
+    data: Optional[Dict[str, Any]],
+    ignore: frozenset,
+) -> Optional[Dict[str, Any]]:
+    """Return a dict fingerprint of ``data`` with volatile fields removed.
+
+    The returned dict is what the dedup mixin compares between ticks.
+    Fields named in ``ignore`` are excluded so that "only counter
+    ticked" updates don't trigger HA state writes; everything else is
+    included so semantic changes (link state, IP, role) still fire.
+    """
+    if not isinstance(data, dict):
+        return None
+    return {k: v for k, v in data.items() if k not in ignore}
+
+
+class _FingerprintedCoordinatorEntity(CoordinatorEntity):
+    """CoordinatorEntity that suppresses no-op state writes.
+
+    Per-tick coordinator updates push to every listener regardless of
+    whether the underlying row actually changed. On a network with
+    dozens of tracked clients this means thousands of HA
+    ``state_changed`` events per minute, almost all of them no-ops
+    that just re-write the recorder with the same value. The
+    fingerprint mixin compares a hash-like dict of the "source row"
+    each tick and short-circuits the state write when nothing
+    semantic moved.
+
+    Subclasses configure two knobs:
+
+    * ``_FINGERPRINT_IGNORE`` — a frozenset of field names whose
+      changes are *not* semantic (counters, throughput, timestamps
+      that tick every poll). When only these fields move, no write.
+    * ``_fingerprint_source`` (property) — returns the current dict
+      for "this entity's row" (the client / WAN / mesh-node payload).
+      Returning ``None`` opts out of dedup for this tick (e.g. row
+      not yet published) — the write proceeds normally.
+
+    Value sensors that *need* per-tick updates because their
+    ``native_value`` reads from a field in ``_FINGERPRINT_IGNORE`` (RX
+    bytes, throughput, uptime, RSSI, ...) must opt back in by
+    overriding ``_FINGERPRINT_IGNORE = frozenset()`` so the fingerprint
+    excludes nothing and counter ticks count as changes.
+    """
+
+    _FINGERPRINT_IGNORE: frozenset = frozenset()
+    _last_fingerprint: Optional[Dict[str, Any]] = None
+
+    @property
+    def _fingerprint_source(self) -> Optional[Dict[str, Any]]:
+        """Return the dict to fingerprint, or None to bypass dedup."""
+        return None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        source = self._fingerprint_source
+        # ``source is None`` -> source unknown for this tick (e.g. first
+        # tick before coordinator data lands, or row removed from
+        # router config). Fall through to the default behaviour so
+        # availability transitions still propagate.
+        if source is not None:
+            fingerprint = _entity_fingerprint(source, self._FINGERPRINT_IGNORE)
+            if fingerprint is not None and fingerprint == self._last_fingerprint:
+                return
+            self._last_fingerprint = fingerprint
+        super()._handle_coordinator_update()
 
 
 class ControllerEntity(CoordinatorEntity):
@@ -92,9 +161,21 @@ class ControllerEntity(CoordinatorEntity):
         )
 
 
-class MeshEntity(CoordinatorEntity):
+class MeshEntity(_FingerprintedCoordinatorEntity):
     """Базовый класс для сущностей Mesh-ноды."""
-    
+
+    # Fields that tick every coordinator update on a healthy mesh node
+    # without representing a semantic change. State sensors built on
+    # MeshEntity (firmware version, local IP, connected binary) skip
+    # the no-op writes; value sensors (CPU, memory, uptime, clients)
+    # set _FINGERPRINT_IGNORE = frozenset() to opt back in.
+    _FINGERPRINT_IGNORE: frozenset = frozenset({
+        "uptime",
+        "cpuload",
+        "memory",
+        "associations",
+    })
+
     def __init__(
         self,
         coordinator: KeeneticCoordinator,
@@ -109,12 +190,32 @@ class MeshEntity(CoordinatorEntity):
     
     @property
     def _node(self) -> Optional[Dict[str, Any]]:
-        """Получить данные ноды из coordinator."""
-        nodes = self.coordinator.data.get("mesh_nodes", [])
-        for node in nodes:
+        """Get this node's current dict via O(1) index, with linear fallback.
+
+        The coordinator publishes ``mesh_nodes_by_cid`` for fast
+        lookup. When the index is absent (older fixture / first tick
+        before coordinator data lands) we fall back to a linear scan
+        of ``mesh_nodes`` so the entity still works.
+        """
+        data = self.coordinator.data
+        if not data:
+            return None
+        index = data.get("mesh_nodes_by_cid")
+        if isinstance(index, dict):
+            # Index exists -> O(1) lookup is authoritative. If the cid
+            # is missing the node has been removed from the router
+            # config and the entity should report unavailable.
+            entry = index.get(self._node_cid)
+            return entry if isinstance(entry, dict) else None
+        # No index published -> fall back to scanning the list.
+        for node in data.get("mesh_nodes", []) or []:
             if (node.get("cid") or node.get("id")) == self._node_cid:
                 return node
         return None
+
+    @property
+    def _fingerprint_source(self) -> Optional[Dict[str, Any]]:
+        return self._node
     
     @property
     def device_info(self) -> DeviceInfo:
@@ -131,13 +232,28 @@ class MeshEntity(CoordinatorEntity):
             fqdn=node.get("fqdn")
         )
     
-class WanEntity(CoordinatorEntity):
+class WanEntity(_FingerprintedCoordinatorEntity):
     """Base class for per-WAN-interface entities.
 
     Each WAN is exposed in HA as its own sub-device under the main
     router, so all of its sensors (status, IP, uptime, throughput, ...)
     are grouped together in the UI.
     """
+
+    # Counter / throughput / uptime fields tick every coordinator pass
+    # on a healthy uplink. State sensors (Public IP, Provider, Role,
+    # Interface) deduplicate; value sensors (RX/TX bytes, throughput,
+    # uptime) opt out with _FINGERPRINT_IGNORE = frozenset().
+    _FINGERPRINT_IGNORE: frozenset = frozenset({
+        "rx_bytes",
+        "tx_bytes",
+        "rx_packets",
+        "tx_packets",
+        "rx_throughput",
+        "tx_throughput",
+        "uptime",
+        "_sample_ts",
+    })
 
     def __init__(
         self,
@@ -153,10 +269,22 @@ class WanEntity(CoordinatorEntity):
 
     @property
     def _wan(self) -> Optional[Dict[str, Any]]:
-        for w in self.coordinator.data.get("wan_interfaces", []) or []:
+        """Get this WAN's current dict via O(1) index, with linear fallback."""
+        data = self.coordinator.data
+        if not data:
+            return None
+        index = data.get("wan_by_id")
+        if isinstance(index, dict):
+            entry = index.get(self._wan_id)
+            return entry if isinstance(entry, dict) else None
+        for w in data.get("wan_interfaces", []) or []:
             if w.get("id") == self._wan_id:
                 return w
         return None
+
+    @property
+    def _fingerprint_source(self) -> Optional[Dict[str, Any]]:
+        return self._wan
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -171,12 +299,28 @@ class WanEntity(CoordinatorEntity):
         )
 
 
-class CryptoMapEntity(CoordinatorEntity):
+class CryptoMapEntity(_FingerprintedCoordinatorEntity):
     """Base class for per-`crypto map` site-to-site IPsec entities.
 
     Each configured crypto map is exposed in HA as its own sub-device
     under the main router, mirroring the per-WAN model.
     """
+
+    # Crypto map counters tick every poll on an established tunnel.
+    # State sensors (Tunnel state, IKE state, Connected) skip no-op
+    # writes; RX/TX byte and throughput sensors opt back in with
+    # _FINGERPRINT_IGNORE = frozenset().
+    _FINGERPRINT_IGNORE: frozenset = frozenset({
+        "rx_bytes",
+        "tx_bytes",
+        "rx_packets",
+        "tx_packets",
+        "rx_throughput",
+        "tx_throughput",
+        "phase2_sa_list",   # SA list churns on rekey
+        "raw_status",        # full status dict — too noisy to compare
+        "_sample_ts",
+    })
 
     def __init__(
         self,
@@ -201,6 +345,10 @@ class CryptoMapEntity(CoordinatorEntity):
         return entry if isinstance(entry, dict) else None
 
     @property
+    def _fingerprint_source(self) -> Optional[Dict[str, Any]]:
+        return self._cmap
+
+    @property
     def available(self) -> bool:
         # Mirror CoordinatorEntity.available but additionally require
         # that our tunnel is still present in the router config. If
@@ -219,9 +367,25 @@ class CryptoMapEntity(CoordinatorEntity):
         )
 
 
-class ClientEntity(CoordinatorEntity):
+class ClientEntity(_FingerprintedCoordinatorEntity):
     """Базовый класс для сущностей отслеживаемых клиентов как отдельных устройств."""
-    
+
+    # Client rows tick these fields on every coordinator pass even when
+    # the device hasn't done anything semantic. State sensors (IP,
+    # link, port, connection type, registered, band, mode) deduplicate;
+    # value sensors (uptime, last-seen, RX/TX, RSSI, txrate, speed)
+    # opt back in with _FINGERPRINT_IGNORE = frozenset().
+    _FINGERPRINT_IGNORE: frozenset = frozenset({
+        "uptime",
+        "last-seen",
+        "rxbytes",
+        "txbytes",
+        "rssi",
+        "txrate",
+        "speed",        # link speed can flap on healthy WiFi without
+                        # representing a real event the user cares about
+    })
+
     def __init__(
         self,
         coordinator: KeeneticCoordinator,
@@ -242,12 +406,28 @@ class ClientEntity(CoordinatorEntity):
     
     @property
     def _client(self) -> Optional[Dict[str, Any]]:
-        """Получить данные клиента из coordinator."""
-        clients = self.coordinator.data.get("clients", []) or []
-        for client in clients:
+        """Get this client's current dict via O(1) MAC index, with linear fallback.
+
+        On a network with hundreds of tracked clients and 15 sensors
+        per client this turns an O(N²) per-tick scan into O(N).
+        """
+        data = self.coordinator.data
+        if not data:
+            return None
+        index = data.get("clients_by_mac")
+        if isinstance(index, dict):
+            entry = index.get(self._mac)
+            return entry if isinstance(entry, dict) else None
+        # Fallback: linear scan when index isn't published (test
+        # fixtures, partial coord data, pre-1.7 coordinator output).
+        for client in data.get("clients", []) or []:
             if str(client.get("mac") or "").lower() == self._mac:
                 return client
         return None
+
+    @property
+    def _fingerprint_source(self) -> Optional[Dict[str, Any]]:
+        return self._client
     
     @property
     def device_info(self) -> DeviceInfo:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from typing import Any
 
 import pyqrcode
@@ -31,6 +32,26 @@ def _is_guest_wifi(network: dict[str, Any]) -> bool:
         or "guest" in description
         or "AccessPoint1" in interface_id
     )
+
+
+def _sanitise_ssid_for_unique_id(ssid: str) -> str:
+    """Turn a free-form SSID into a stable, registry-safe slug.
+
+    SSIDs can contain spaces, punctuation, emoji, and other characters
+    that don't belong in entity unique_ids or entity_ids. The slug is
+    lowercased, alphanumeric-and-underscore only, no leading or trailing
+    underscores. Used by the per-SSID QR entities introduced for
+    issue #45.
+
+    Examples:
+        "Chapay"            -> "chapay"
+        "Chapay_5G"         -> "chapay_5g"
+        "Chapay 404 5G"     -> "chapay_404_5g"
+        "Café WiFi"         -> "caf_wifi"
+    """
+    if not ssid:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]+", "_", ssid).strip("_").lower()
 
 
 def _band_rank(network: dict[str, Any]) -> int:
@@ -156,6 +177,70 @@ async def async_setup_entry(
             KeeneticQrWiFiImageEntity(coordinator, entry, guest_network, "guest")
         )
 
+    # ============================================================
+    # Issue #45: per-SSID QR entities — but only for SSIDs not
+    # already covered by the legacy main/guest entities above.
+    #
+    # The legacy "main + guest" model handles the common case of a
+    # single primary SSID (possibly dual-band) plus a single guest
+    # SSID. Adding per-SSID entities on top of that for those same
+    # SSIDs would just produce duplicates that clutter the device
+    # page (e.g. for a Jeff_Murdock + Guest setup you'd get four
+    # QR entities for two networks).
+    #
+    # The per-SSID path is reserved for the case that broke #45 —
+    # routers with three or more SSIDs where `_select_best_network`
+    # silently dropped the loser. Example: Chapay (2.4) + Chapay_5G
+    # (5) + Chapay 404 5G (5). _select_best_network picks Chapay_5G
+    # as main and Chapay 404 5G as guest; "Chapay" is left out.
+    # The block below catches exactly that leftover.
+    # ============================================================
+    covered_ssids: set[str] = set()
+    if main_network and main_network.get("ssid"):
+        covered_ssids.add(main_network["ssid"])
+    if guest_network and guest_network.get("ssid"):
+        covered_ssids.add(guest_network["ssid"])
+
+    networks_by_ssid: dict[str, list[dict[str, Any]]] = {}
+    for net in main_candidates + guest_candidates:
+        ssid = (net.get("ssid") or "").strip()
+        if not ssid or ssid in covered_ssids:
+            continue
+        networks_by_ssid.setdefault(ssid, []).append(net)
+
+    seen_ssid_slugs: set[str] = set()
+    for ssid, nets in networks_by_ssid.items():
+        # Pick the best AP among the bands for this SSID
+        best_for_ssid = _select_best_network(nets)
+        if not best_for_ssid:
+            continue
+
+        slug = _sanitise_ssid_for_unique_id(ssid)
+        if not slug or slug in seen_ssid_slugs:
+            # If two SSIDs sanitise to the same slug (extremely rare —
+            # would require e.g. "Foo Bar" and "Foo-Bar" on the same
+            # router) we keep only the first to avoid unique_id
+            # collisions, which would crash the entity registry on
+            # setup.
+            continue
+        seen_ssid_slugs.add(slug)
+
+        _LOGGER.info(
+            "Creating per-SSID Wi-Fi QR entity (uncovered): ssid=%s id=%s band=%s slug=%s",
+            ssid,
+            best_for_ssid.get("id"),
+            best_for_ssid.get("band"),
+            slug,
+        )
+        images.append(
+            KeeneticQrWiFiImageEntity(
+                coordinator,
+                entry,
+                best_for_ssid,
+                f"ssid_{slug}",
+            )
+        )
+
     async_add_entities(images)
     _LOGGER.debug("Added %d Wi-Fi QR image entities", len(images))
 
@@ -182,7 +267,7 @@ class KeeneticQrWiFiImageEntity(CoordinatorEntity[KeeneticCoordinator], ImageEnt
         coordinator: KeeneticCoordinator,
         entry: ConfigEntry,
         wifi_network: dict[str, Any],
-        network_type: str,  # "main" or "guest"
+        network_type: str,  # "main", "guest", or "ssid_<sanitised_ssid>"
     ) -> None:
         """Initialize the QR code image entity."""
         CoordinatorEntity.__init__(self, coordinator)
@@ -195,15 +280,27 @@ class KeeneticQrWiFiImageEntity(CoordinatorEntity[KeeneticCoordinator], ImageEnt
         self._attr_device_info = self._get_device_info()
         self._attr_unique_id = f"{entry.entry_id}_wifi_qr_{network_type}"
         self._attr_image_last_updated = dt_util.utcnow()
-        self._attr_translation_key = f"qr_wifi_{network_type}"
-        self._attr_translation_placeholders = {
-            "ssid": wifi_network.get("ssid", "Wi-Fi"),
-        }
+
+        ssid = wifi_network.get("ssid", "Wi-Fi")
+
+        # Per-SSID entities (issue #45) use a direct name with the SSID
+        # embedded, instead of relying on the per-network_type
+        # translation_key. We can't ship a translation key for every
+        # conceivable SSID, and the SSID itself is the most informative
+        # label anyway. The legacy "main"/"guest" entities keep the
+        # original translation-key path so dashboards / automations
+        # that reference their localised names continue to work.
+        if network_type.startswith("ssid_"):
+            self._attr_name = f"Wi-Fi QR {ssid}"
+            self._attr_translation_key = None
+        else:
+            self._attr_translation_key = f"qr_wifi_{network_type}"
+            self._attr_translation_placeholders = {"ssid": ssid}
 
         _LOGGER.debug(
             "Created QR entity for %s network: %s",
             network_type,
-            wifi_network.get("ssid"),
+            ssid,
         )
 
     def _get_password_from_interfaces(self) -> str | None:
