@@ -93,7 +93,7 @@ def _async_update_insecure_http_issue(
         ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
-PLATFORMS: list[str] = ["sensor", "switch", "device_tracker", "button", "binary_sensor", "select", "update", "image"]
+PLATFORMS: list[str] = ["sensor", "switch", "device_tracker", "button", "binary_sensor", "select", "update", "image", "number"]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:

@@ -95,6 +95,7 @@ TO_REDACT: set[str] = {
 # entries here" without exposing what they were.
 _MAC_KEYED_INDEXES = (
     "host_policies",
+    "traffic_shapes",
 )
 
 

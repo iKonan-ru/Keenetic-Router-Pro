@@ -96,6 +96,7 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             mesh_nodes,
             client_stats,
             host_policies,
+            traffic_shapes,
             ndns_info,
             usb_storage,
             interface_stats,
@@ -112,6 +113,11 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _bounded(self.client.async_get_mesh_nodes()),
             _bounded(self.client.async_get_client_stats()),
             _bounded(self.client.async_get_host_policies()),
+            # Sprint 11 (issue #42) — per-host bandwidth limits.
+            # Best-effort fetch: routers without the ``traffic-shape``
+            # component installed return an empty dict via the
+            # capability cache and never get polled again.
+            _bounded(self.client.async_get_traffic_shapes()),
             _bounded(self.client.async_get_ndns_info()),
             _bounded(self.client.async_get_usb_storage()),
             _bounded(self.client.async_get_all_interface_stats()),
@@ -135,6 +141,8 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mesh_nodes = _ok("mesh_nodes", mesh_nodes, [])
         client_stats = _ok("client_stats", client_stats, {})
         host_policies = _ok("host_policies", host_policies, {})
+        # Silent: routers without traffic-shape component return {}.
+        traffic_shapes = _ok("traffic_shapes", traffic_shapes, {}, silent=True)
         ndns_info = _ok("ndns_info", ndns_info, {})
         usb_storage = _ok("usb_storage", usb_storage, [])
         interface_stats = _ok("interface_stats", interface_stats, {})
@@ -501,6 +509,7 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "client_stats": client_stats,
             "ndns": ndns_info,
             "host_policies": host_policies,
+            "traffic_shapes": traffic_shapes,
             "usb_storage": usb_storage,
             "port_info": port_info,
             "mesh_usb": mesh_usb,

@@ -14,6 +14,7 @@ import logging
 import re
 
 from .const import DOMAIN
+from .utils import safe_int
 
 _LOGGER = logging.getLogger(f"custom_components.{DOMAIN}.api")
 
@@ -2900,6 +2901,146 @@ class KeeneticClient:
     async def async_unblock_client(self, mac: str) -> None:
         """Unblock a client's internet access."""
         await self.async_set_client_policy(mac, "default")
+
+    async def async_get_traffic_shapes(self) -> Dict[str, int]:
+        """Get per-host bandwidth limits (``ip traffic-shape`` config).
+
+        Returns a mapping of normalised MAC (lowercase, colon-separated)
+        to the configured rate in **kbit/s**. Hosts without a configured
+        rate are absent from the dict — callers should treat absence as
+        "unlimited" rather than zero.
+
+        The endpoint shape we rely on (verified against firmware via
+        the maintainer's router): ``GET /rci/ip/traffic-shape/host``
+        returns a flat list of ``{mac, rate}`` objects. A small subset
+        of older firmwares wrap it under a top-level ``host`` key
+        (``GET /rci/ip/traffic-shape``), which we accept as a fallback.
+
+        Routers without the ``traffic-shape`` component installed
+        return 404 — we cache that on the first miss so subsequent
+        ticks short-circuit, matching how other optional features
+        (DNS proxy, IPsec VICI, ping-check) behave. Issue #42.
+        """
+        if getattr(self, "_traffic_shape_supported", True) is False:
+            return {}
+
+        def _parse(payload: Any) -> Dict[str, int]:
+            # Accept both ``[{mac, rate}, ...]`` and ``{"host": [...]}``
+            # plus the very-occasional ``{"host": {<mac>: {rate}}}``
+            # variant some firmware betas use.
+            entries: list = []
+            if isinstance(payload, list):
+                entries = payload
+            elif isinstance(payload, dict):
+                inner = payload.get("host", payload)
+                if isinstance(inner, list):
+                    entries = inner
+                elif isinstance(inner, dict):
+                    # mac-keyed dict form
+                    entries = [
+                        {"mac": k, **(v if isinstance(v, dict) else {})}
+                        for k, v in inner.items()
+                    ]
+            out: Dict[str, int] = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                mac = str(entry.get("mac") or "").lower().replace("-", ":")
+                rate = entry.get("rate")
+                # Only accept ints / numeric strings — anything else is
+                # a parser surprise and we'd rather show "no limit" than
+                # populate the slider with garbage.
+                rate_int = safe_int(rate)
+                if mac and isinstance(rate_int, int) and rate_int > 0:
+                    out[mac] = rate_int
+            return out
+
+        # Primary endpoint first — fastest, most direct shape.
+        try:
+            data = await self._rci_get("ip/traffic-shape/host")
+            return _parse(data)
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                # Fall through to the alternate shape before deciding
+                # the whole feature is unsupported.
+                pass
+            else:
+                _LOGGER.debug("traffic-shape/host fetch error: %s", err)
+                return {}
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("traffic-shape/host fetch error: %s", err)
+            return {}
+
+        # Alternate endpoint shape for some firmwares.
+        try:
+            data = await self._rci_get("ip/traffic-shape")
+            return _parse(data)
+        except KeeneticApiError as err:
+            if _is_endpoint_missing(err):
+                self._traffic_shape_supported = False
+                _LOGGER.debug(
+                    "ip/traffic-shape endpoint missing — caching as "
+                    "unsupported on this firmware"
+                )
+            else:
+                _LOGGER.debug("traffic-shape fetch error: %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("traffic-shape fetch error: %s", err)
+
+        return {}
+
+    async def async_set_client_bandwidth(self, mac: str, kbps: int) -> None:
+        """Set or clear the per-host bandwidth limit for a client.
+
+        Mirrors the ``async_set_client_policy`` shape (CLI commands
+        through ``_rci_parse`` followed by ``system configuration
+        save``) so the user's running config matches what they'd get
+        out of the Keenetic web UI.
+
+        Setting ``kbps > 0`` issues ``ip traffic-shape host <mac> rate
+        <kbps>``. Keenetic CLI is idempotent on this command — feeding
+        a new rate replaces the previous one in one shot, no separate
+        "remove old then add new" dance required.
+
+        Setting ``kbps == 0`` issues ``no ip traffic-shape host <mac>``,
+        which removes the whole host entry from the running config —
+        equivalent to "no limit" in the web UI. (The shorter ``no ...
+        rate`` form is silently dropped by several Keenetic firmwares,
+        so we use the entry-level remove for portability.)
+
+        Both paths end with a configuration save so the limit survives
+        a router reboot. This is the same persistence guarantee the
+        existing policy / block / unblock methods give. Issue #42.
+        """
+        mac_clean = mac.lower().replace("-", ":")
+        safe_mac = _validate_cli_arg(mac_clean, "client mac")
+
+        if kbps <= 0:
+            # Removal form. The natural-looking
+            # ``no ip traffic-shape host <mac> rate`` is silently
+            # ignored on at least some Keenetic firmwares (verified
+            # against KN-1xxx/KN-2xxx series during issue #42 testing)
+            # — the router accepts the command but the line stays in
+            # the running config. Dropping the whole host entry works
+            # universally: ``host <mac>`` only ever contains a single
+            # ``rate`` field under ``ip traffic-shape``, so there are
+            # no other per-host settings to preserve, and the next
+            # ``set`` will recreate the entry from scratch.
+            cmd = f"no ip traffic-shape host {safe_mac}"
+            _LOGGER.debug("Removing bandwidth limit from client %s", mac_clean)
+        else:
+            # Clamp to a reasonable upper bound to defend against a
+            # caller passing a wild value. 10 Gbit/s in kbit/s is
+            # already way past anything any home router can shape.
+            kbps_clamped = max(1, min(int(kbps), 10_000_000))
+            cmd = f"ip traffic-shape host {safe_mac} rate {kbps_clamped}"
+            _LOGGER.debug(
+                "Setting bandwidth limit on client %s to %d kbit/s",
+                mac_clean, kbps_clamped,
+            )
+
+        await self._rci_parse(cmd)
+        await self._rci_parse("system configuration save")
 
     async def async_check_firmware_update(self) -> Dict[str, Any]:
         """Check for available firmware update via /rci/show/version."""
