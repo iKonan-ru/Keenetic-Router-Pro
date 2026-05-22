@@ -101,6 +101,29 @@ from .ipsec import (
     KeeneticIpsecViciStatusSensor,
     KeeneticIpsecViciOutOfMemorySensor,
 )
+from .lte import (
+    is_lte_wan,
+    # Data usage (issue #47 primary)
+    KeeneticLteDataUsedSensor,
+    KeeneticLteDataRemainingSensor,
+    KeeneticLteDataLimitSensor,
+    KeeneticLteDataThresholdSensor,
+    KeeneticLteDaysUntilResetSensor,
+    KeeneticLteQuotaUsageSensor,
+    # Cellular telemetry (bonus)
+    KeeneticLteOperatorSensor,
+    KeeneticLteTechnologySensor,
+    KeeneticLteSignalLevelSensor,
+    KeeneticLteRssiSensor,
+    KeeneticLteRsrpSensor,
+    KeeneticLteRsrqSensor,
+    KeeneticLteCinrSensor,
+    KeeneticLteBandSensor,
+    KeeneticLteRoamingSensor,
+    KeeneticLteTemperatureSensor,
+    KeeneticLteConnectionStateSensor,
+    KeeneticLteApnSensor,
+)
 
 
 async def async_setup_entry(
@@ -240,11 +263,39 @@ async def async_setup_entry(
 
     # Per-WAN sensor set: one sub-device per uplink (Default + backups).
     # Covers provider name, priority role, underlying interface, public
-    # IP, uptime, byte counters and live throughput.
+    # IP, uptime, byte counters and live throughput. Cellular uplinks
+    # (LTE/4G/5G modems) additionally surface a data-usage block plus
+    # a cellular telemetry block — issue #47.
     known_wan_ids: set[str] = set()
 
-    def _wan_sensor_set(wan_id: str) -> list[SensorEntity]:
+    def _lte_sensor_set(wan_id: str) -> list[SensorEntity]:
+        # Two logical groups, but they share the same WAN sub-device
+        # in HA so the user sees one card covering everything cellular.
         return [
+            # Data usage / quota (primary issue #47)
+            KeeneticLteDataUsedSensor(coordinator, entry, wan_id),
+            KeeneticLteDataRemainingSensor(coordinator, entry, wan_id),
+            KeeneticLteDataLimitSensor(coordinator, entry, wan_id),
+            KeeneticLteDataThresholdSensor(coordinator, entry, wan_id),
+            KeeneticLteDaysUntilResetSensor(coordinator, entry, wan_id),
+            KeeneticLteQuotaUsageSensor(coordinator, entry, wan_id),
+            # Cellular telemetry (bonus diagnostics)
+            KeeneticLteOperatorSensor(coordinator, entry, wan_id),
+            KeeneticLteTechnologySensor(coordinator, entry, wan_id),
+            KeeneticLteSignalLevelSensor(coordinator, entry, wan_id),
+            KeeneticLteRssiSensor(coordinator, entry, wan_id),
+            KeeneticLteRsrpSensor(coordinator, entry, wan_id),
+            KeeneticLteRsrqSensor(coordinator, entry, wan_id),
+            KeeneticLteCinrSensor(coordinator, entry, wan_id),
+            KeeneticLteBandSensor(coordinator, entry, wan_id),
+            KeeneticLteRoamingSensor(coordinator, entry, wan_id),
+            KeeneticLteTemperatureSensor(coordinator, entry, wan_id),
+            KeeneticLteConnectionStateSensor(coordinator, entry, wan_id),
+            KeeneticLteApnSensor(coordinator, entry, wan_id),
+        ]
+
+    def _wan_sensor_set(wan_id: str, wan_dict: dict | None = None) -> list[SensorEntity]:
+        sensors: list[SensorEntity] = [
             KeeneticWanProviderSensor(coordinator, entry, wan_id),
             KeeneticWanRoleSensor(coordinator, entry, wan_id),
             KeeneticWanInterfaceSensor(coordinator, entry, wan_id),
@@ -255,13 +306,16 @@ async def async_setup_entry(
             KeeneticWanRxThroughputSensor(coordinator, entry, wan_id),
             KeeneticWanTxThroughputSensor(coordinator, entry, wan_id),
         ]
+        if is_lte_wan(wan_dict):
+            sensors.extend(_lte_sensor_set(wan_id))
+        return sensors
 
     for wan in coordinator.data.get("wan_interfaces", []) or []:
         wan_id = wan.get("id")
         if not wan_id or wan_id in known_wan_ids:
             continue
         known_wan_ids.add(wan_id)
-        entities.extend(_wan_sensor_set(wan_id))
+        entities.extend(_wan_sensor_set(wan_id, wan))
 
     # Per-crypto-map sensor set: one sub-device per site-to-site
     # IPsec tunnel. Covers the two state strings (tunnel, IKE), byte
@@ -312,7 +366,9 @@ async def async_setup_entry(
             if not wan_id or wan_id in known_wan_ids:
                 continue
             known_wan_ids.add(wan_id)
-            new_entities.extend(_wan_sensor_set(wan_id))
+            # Pass the WAN dict so hot-plugged LTE sticks (added
+            # after HA started) also get cellular sensors.
+            new_entities.extend(_wan_sensor_set(wan_id, wan))
         for cmap_name in (coordinator.data.get("crypto_maps") or {}).keys():
             if cmap_name in known_cmap_names:
                 continue

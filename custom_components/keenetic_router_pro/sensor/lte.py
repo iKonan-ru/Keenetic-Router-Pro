@@ -1,29 +1,33 @@
-"""LTE / cellular WAN diagnostic sensors for Keenetic Router Pro.
+"""LTE / cellular sensors for Keenetic Router Pro — issue #47.
 
-These sensors hang off the per-WAN sub-device when the underlying
-interface is identified as a cellular modem (UsbModem*, UsbQmi*,
-UsbLte*). They surface the LTE-specific telemetry that the generic
-WAN sensors don't expose: signal quality (RSSI, RSRP, RSRQ, SINR),
-operator name, access technology (LTE / 5G / 3G), current band,
-and registration / roaming state.
+Two distinct sensor families share this module:
 
-The Keenetic API delivers all of this inside the ``mobile`` sub-dict
-of the raw ``show interface`` payload, so no additional API call is
-needed — these sensors read straight from coordinator data that the
-existing WAN fetch already produced.
+1. **Data-usage sensors** (the primary issue #47 ask). Source: the
+   ``show interface traffic-counter`` endpoint, which mirrors the
+   "Data Usage & Limit" page in the Keenetic web UI. Five sensors
+   per LTE interface plus two binary alarms: used / remaining /
+   limit / threshold / days-until-reset / quota %, plus
+   limit-exceeded and threshold-exceeded binary sensors.
 
-Why expose them at all if HA's long-term statistics can derive
-daily/monthly data totals from the existing RX/TX byte sensors?
-Because signal quality is the single most useful piece of telemetry
-for a router that's actually a cellular gateway: bad RSRP/SINR
-explains slow speeds, an unexpected drop in registration explains
-an outage, and the operator/band combo tells the user which tower
-they're talking to. None of that is derivable from byte counters.
+2. **LTE diagnostics** (bonus telemetry). Source: the flat top-level
+   fields on the LTE interface payload itself. Operator, technology,
+   signal-level bars, RSSI / RSRP / RSRQ / CINR, band, roaming flag,
+   modem temperature, connection state. These existed in an earlier
+   sprint with the wrong field paths (assumed ``raw.mobile.*`` nesting
+   that some firmwares use, but not the maintainer's UsbLte0 on
+   Marvell-based hardware); this implementation reads the flat layout
+   that real firmware actually returns.
+
+Both families attach to the existing per-WAN sub-device that the
+generic WAN sensors already populate — so a user with a 4G uplink
+sees one device card with throughput, byte counters, signal quality
+and quota usage all together, not two scattered devices.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import logging
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -35,58 +39,66 @@ from homeassistant.const import (
     EntityCategory,
     SIGNAL_STRENGTH_DECIBELS,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    UnitOfInformation,
+    UnitOfTemperature,
+    UnitOfTime,
+    PERCENTAGE,
 )
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import WanEntity
-from ..utils import safe_int
+from ..utils import safe_float, safe_int
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def is_lte_wan(wan: dict[str, Any] | None) -> bool:
     """Return True if a WAN dict represents a cellular / LTE modem.
 
-    Identification is heuristic: Keenetic firmwares disagree on the
-    capitalisation of interface types and on whether `mobile.*` data
-    is exposed for newer modems. We accept the union of all forms
-    seen in the wild rather than insist on a single canonical match.
-
-    A future firmware that exposes a brand-new modem `type` will
-    simply not get LTE sensors until added here — the generic WAN
-    sensors (Public IP, RX/TX bytes, throughput, uptime) keep working
-    regardless, so a misidentification just hides extra telemetry,
-    it never breaks core functionality.
+    Uses the trait list as primary signal because Keenetic traits are
+    stable across firmware versions. Falls back to type-name matching
+    and id-prefix tokens for older firmwares that don't populate
+    traits, and to the presence of a ``mobile.*`` sub-dict (used by
+    nested-format firmware variants) as a last resort.
     """
     if not isinstance(wan, dict):
         return False
+    raw = wan.get("raw") if isinstance(wan.get("raw"), dict) else {}
     iface_id = str(wan.get("id") or "").lower()
-    iface_type = str(wan.get("type") or "").lower()
-    if any(token in iface_id for token in ("usbmodem", "usbqmi", "usblte")):
+    iface_type = str(wan.get("type") or raw.get("type") or "").lower()
+    traits = raw.get("traits") or wan.get("traits") or []
+    if isinstance(traits, list) and (
+        "UsbLte" in traits or "Mobile" in traits
+    ):
         return True
     if iface_type in ("usblte", "usbmodem", "usbqmi", "usbmodemcdc"):
         return True
-    if any(token in iface_type for token in ("mobile", "lte", "3g", "4g", "5g")):
+    if any(tok in iface_id for tok in ("usblte", "usbmodem", "usbqmi")):
         return True
-    # Final fallback: a `mobile` sub-dict in raw is strong evidence
-    # the firmware itself classified this as a cellular interface,
-    # even if the type string doesn't match any of our known tokens.
-    raw = wan.get("raw") if isinstance(wan, dict) else None
-    if isinstance(raw, dict) and isinstance(raw.get("mobile"), dict):
+    if any(tok in iface_type for tok in ("mobile", "lte", "3g", "4g", "5g")):
+        return True
+    # Some firmwares group mobile fields under raw.mobile.*; presence
+    # of that sub-dict is a strong "is cellular" signal.
+    if isinstance(raw.get("mobile"), dict):
         return True
     return False
 
 
-class _LteSensorBase(WanEntity, SensorEntity):
-    """Shared base for LTE-specific sensors hanging off a WAN sub-device.
+# ---------------------------------------------------------------------------
+# Shared base
+# ---------------------------------------------------------------------------
 
-    The mobile telemetry lives inside the WAN's ``raw.mobile`` dict.
-    Centralising the lookup here keeps every child sensor reading
-    from a single source of truth and ensures all of them go to
-    ``unavailable`` together when the modem disconnects (rather than
-    showing stale per-field values).
+
+class _LteSensorBase(WanEntity, SensorEntity):
+    """Base for cellular sensors that read from coordinator data only.
+
+    All LTE-family sensors are gated on the same "available" condition
+    — if the coordinator doesn't have a WAN entry for our interface
+    they all go to "unavailable" together, rather than each one
+    independently rendering as 'Unknown'.
     """
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,
@@ -99,39 +111,228 @@ class _LteSensorBase(WanEntity, SensorEntity):
         )
 
     @property
-    def _mobile(self) -> dict[str, Any]:
-        """Return the ``mobile`` sub-dict from this WAN's raw payload.
-
-        Empty dict if the modem isn't reporting (transient disconnect,
-        unsupported firmware field). Sensors then surface ``None`` as
-        their native_value, which HA renders as "Unknown".
-        """
+    def _raw(self) -> dict[str, Any]:
+        """Flat top-level interface payload from ``show interface``."""
         wan = self._wan
         if not wan:
             return {}
         raw = wan.get("raw")
-        if not isinstance(raw, dict):
-            return {}
-        mobile = raw.get("mobile")
-        return mobile if isinstance(mobile, dict) else {}
+        return raw if isinstance(raw, dict) else {}
+
+    @property
+    def _mobile_sub(self) -> dict[str, Any]:
+        """``raw.mobile.*`` sub-dict (for firmwares using nested layout).
+
+        Several Keenetic firmware revisions place LTE telemetry under
+        a ``mobile`` sub-key; others (e.g. UsbLte0 / Marvell-based
+        modems verified by the maintainer) keep everything flat on
+        the top-level interface payload. Sensors below check both
+        layouts: flat first (more common on cellular-only modems),
+        then the nested fallback.
+        """
+        m = self._raw.get("mobile")
+        return m if isinstance(m, dict) else {}
+
+    @property
+    def _usage(self) -> dict[str, Any]:
+        """Per-interface traffic-counter dict from the coordinator."""
+        data = self.coordinator.data or {}
+        usage_map = data.get("lte_data_usage") or {}
+        return usage_map.get(self._wan_id, {}) if isinstance(usage_map, dict) else {}
 
     @property
     def available(self) -> bool:
-        # The sensor is "available" if we have *any* WAN data at all.
-        # Whether the modem has registered with the network is then
-        # the value the sensor reports, not its availability — that
-        # way state history doesn't gap during transient drops.
         return self._wan is not None
 
 
 # ---------------------------------------------------------------------------
-# Text / identity sensors
+# Data-usage sensors (issue #47 primary)
 # ---------------------------------------------------------------------------
 
 
+class _LteDataUsageSensorBase(_LteSensorBase):
+    """Marker base: data-usage sensors are unavailable if traffic-counter is off.
+
+    A user can disable the counter on the router without removing the
+    SIM — that's a valid state, but in HA it should look "unavailable"
+    rather than report 0 GB, so daily/monthly statistics don't accrue
+    spurious zeros.
+    """
+
+    @property
+    def available(self) -> bool:
+        if not super().available:
+            return False
+        usage = self._usage
+        return bool(usage) and usage.get("enabled", False)
+
+
+class KeeneticLteDataUsedSensor(_LteDataUsageSensorBase):
+    """Current month-to-date data usage in GB."""
+    _attr_icon = "mdi:download-network"
+    _attr_native_unit_of_measurement = UnitOfInformation.GIGABYTES
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 2
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_data_used"
+
+    @property
+    def name(self) -> str:
+        return "Data Used"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._usage.get("used_gb")
+
+
+class KeeneticLteDataRemainingSensor(_LteDataUsageSensorBase):
+    """Remaining data in GB until the monthly quota is reached."""
+    _attr_icon = "mdi:gauge"
+    _attr_native_unit_of_measurement = UnitOfInformation.GIGABYTES
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_data_remaining"
+
+    @property
+    def name(self) -> str:
+        return "Data Remaining"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._usage.get("remaining_gb")
+
+
+class KeeneticLteDataLimitSensor(_LteDataUsageSensorBase):
+    """Configured monthly data limit in GB (diagnostic)."""
+    _attr_icon = "mdi:database-arrow-up"
+    _attr_native_unit_of_measurement = UnitOfInformation.GIGABYTES
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_suggested_display_precision = 2
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_data_limit"
+
+    @property
+    def name(self) -> str:
+        return "Data Limit"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._usage.get("limit_gb")
+
+
+class KeeneticLteDataThresholdSensor(_LteDataUsageSensorBase):
+    """Warning threshold in GB (diagnostic)."""
+    _attr_icon = "mdi:alert-circle-outline"
+    _attr_native_unit_of_measurement = UnitOfInformation.GIGABYTES
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_suggested_display_precision = 2
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_data_threshold"
+
+    @property
+    def name(self) -> str:
+        return "Data Threshold"
+
+    @property
+    def native_value(self) -> float | None:
+        return self._usage.get("threshold_gb")
+
+
+class KeeneticLteDaysUntilResetSensor(_LteDataUsageSensorBase):
+    """Days remaining until the monthly counter resets."""
+    _attr_icon = "mdi:calendar-clock"
+    _attr_native_unit_of_measurement = UnitOfTime.DAYS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_days_until_reset"
+
+    @property
+    def name(self) -> str:
+        return "Days Until Reset"
+
+    @property
+    def native_value(self) -> int | None:
+        return self._usage.get("days_left")
+
+
+class KeeneticLteQuotaUsageSensor(_LteDataUsageSensorBase):
+    """Current quota usage as a percentage of the configured limit.
+
+    Computed locally rather than from the router because the router's
+    "threshold" value is itself a percentage of the limit (e.g. 90 %)
+    — the router never reports "current % of limit", just the absolute
+    value-in-GB pair. Local computation also means the percentage
+    updates the moment ``used_gb`` ticks, even between coordinator
+    refreshes that miss a counter-save event.
+    """
+    _attr_icon = "mdi:percent"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_quota_usage"
+
+    @property
+    def name(self) -> str:
+        return "Quota Usage"
+
+    @property
+    def native_value(self) -> float | None:
+        usage = self._usage
+        used = usage.get("used_gb")
+        limit = usage.get("limit_gb")
+        if used is None or limit is None or limit <= 0:
+            return None
+        pct = (used / limit) * 100.0
+        # Defensive clamp: routers occasionally over-report by a sliver
+        # past 100 % between threshold-trigger and counter-reset, but
+        # values like 250 % would just look broken.
+        return max(0.0, min(pct, 999.0))
+
+
+# ---------------------------------------------------------------------------
+# LTE telemetry sensors (bonus diagnostics)
+# ---------------------------------------------------------------------------
+
+
+def _flat_or_nested(raw: dict[str, Any], mobile: dict[str, Any], *keys: str) -> Any:
+    """Find a value by trying it at the flat root first, then under mobile.*.
+
+    Both layouts are seen in the wild; we want every sensor to work on
+    both without each one duplicating the fallback chain inline.
+    """
+    for k in keys:
+        if k in raw and raw[k] not in (None, ""):
+            return raw[k]
+    for k in keys:
+        if k in mobile and mobile[k] not in (None, ""):
+            return mobile[k]
+    return None
+
+
 class KeeneticLteOperatorSensor(_LteSensorBase):
-    """Carrier / mobile network operator name (e.g. ``Vodafone TR``)."""
+    """Mobile network operator name (e.g. ``Avea``)."""
     _attr_icon = "mdi:cellphone-cog"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def unique_id(self) -> str:
@@ -143,18 +344,24 @@ class KeeneticLteOperatorSensor(_LteSensorBase):
 
     @property
     def native_value(self) -> str | None:
-        m = self._mobile
-        return (
-            m.get("operator")
-            or m.get("provider")
-            or m.get("plmn-description")
-            or None
+        v = _flat_or_nested(
+            self._raw, self._mobile_sub,
+            "operator", "provider", "plmn-description",
         )
+        return str(v) if v is not None else None
 
 
 class KeeneticLteTechnologySensor(_LteSensorBase):
-    """Access technology currently in use (LTE / 5G / 3G / 2G)."""
+    """Access technology in use (``4G`` / ``5G`` / ``3G`` / ``2G``).
+
+    On firmwares using the flat layout the ``mobile`` key on the
+    interface payload is *itself* a string with the technology name
+    (verified against UsbLte0 returning ``mobile: "4G"``). On nested
+    layouts the equivalent value lives at ``mobile.access-technology``.
+    We accept both.
+    """
     _attr_icon = "mdi:signal-cellular-3"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def unique_id(self) -> str:
@@ -166,120 +373,66 @@ class KeeneticLteTechnologySensor(_LteSensorBase):
 
     @property
     def native_value(self) -> str | None:
-        m = self._mobile
-        # Firmwares use a few different field names — try them in
-        # order of how informative they tend to be.
-        return (
-            m.get("access-technology")
-            or m.get("technology")
-            or m.get("mode")
-            or m.get("network-type")
-            or None
+        # Flat: raw.mobile is a string ("4G"). Nested: raw.mobile is a
+        # dict, so check nested keys instead.
+        flat_mobile = self._raw.get("mobile")
+        if isinstance(flat_mobile, str) and flat_mobile.strip():
+            return flat_mobile
+        v = _flat_or_nested(
+            self._raw, self._mobile_sub,
+            "access-technology", "technology", "mode", "network-type",
         )
+        return str(v) if v is not None else None
 
 
-class KeeneticLteBandSensor(_LteSensorBase):
-    """Current LTE/5G band (e.g. ``B7``, ``B20``)."""
-    _attr_icon = "mdi:radio-tower"
-
-    @property
-    def unique_id(self) -> str:
-        return f"{self._entry_id}_wan_{self._wan_id}_lte_band"
-
-    @property
-    def name(self) -> str:
-        return "LTE Band"
-
-    @property
-    def native_value(self) -> str | None:
-        m = self._mobile
-        band = m.get("band") or m.get("current-band") or m.get("active-band")
-        return str(band) if band is not None else None
-
-
-class KeeneticLteCellIdSensor(_LteSensorBase):
-    """Serving cell ID. Useful for tracking which tower we're on."""
-    _attr_icon = "mdi:cellphone-marker"
-    _attr_entity_registry_enabled_default = False  # diagnostic, opt-in
-
-    @property
-    def unique_id(self) -> str:
-        return f"{self._entry_id}_wan_{self._wan_id}_lte_cell_id"
-
-    @property
-    def name(self) -> str:
-        return "LTE Cell ID"
-
-    @property
-    def native_value(self) -> str | None:
-        m = self._mobile
-        cell = m.get("cellid") or m.get("cell-id") or m.get("eci")
-        return str(cell) if cell is not None else None
-
-
-class KeeneticLteRegistrationSensor(_LteSensorBase):
-    """Network-registration state (``home``, ``roaming``, ``searching``)."""
-    _attr_icon = "mdi:cellphone-link"
-
-    @property
-    def unique_id(self) -> str:
-        return f"{self._entry_id}_wan_{self._wan_id}_lte_registration"
-
-    @property
-    def name(self) -> str:
-        return "LTE Registration"
-
-    @property
-    def native_value(self) -> str | None:
-        m = self._mobile
-        reg = (
-            m.get("registration")
-            or m.get("status")
-            or m.get("network-status")
-        )
-        return str(reg) if reg is not None else None
-
-
-# ---------------------------------------------------------------------------
-# Signal-quality sensors
-# ---------------------------------------------------------------------------
-
-
-class KeeneticLteSignalSensor(_LteSensorBase):
-    """Raw signal strength (RSSI). Negative dBm; closer to 0 is better."""
+class KeeneticLteSignalLevelSensor(_LteSensorBase):
+    """Signal bars (0-5). Driven by the modem's own bucketing."""
     _attr_icon = "mdi:signal"
-    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
-    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def unique_id(self) -> str:
-        return f"{self._entry_id}_wan_{self._wan_id}_lte_signal"
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_signal_level"
 
     @property
     def name(self) -> str:
-        return "LTE Signal"
+        return "LTE Signal Level"
 
     @property
     def native_value(self) -> int | None:
-        m = self._mobile
-        wan_raw = (self._wan or {}).get("raw") or {}
-        # Try mobile.signal, mobile.rssi, then the top-level signal
-        # field some firmwares put outside of mobile.*
-        for key in ("signal", "rssi", "signal-strength"):
-            v = m.get(key) if key in m else None
-            if v is not None:
-                return safe_int(v)
-        v = wan_raw.get("signal")
-        return safe_int(v) if v is not None else None
+        v = _flat_or_nested(self._raw, self._mobile_sub, "signal-level")
+        return safe_int(v)
+
+
+class KeeneticLteRssiSensor(_LteSensorBase):
+    """Raw signal strength (RSSI). Negative dBm; closer to 0 is better."""
+    _attr_icon = "mdi:wifi-strength-2"
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_rssi"
+
+    @property
+    def name(self) -> str:
+        return "LTE RSSI"
+
+    @property
+    def native_value(self) -> int | None:
+        v = _flat_or_nested(self._raw, self._mobile_sub, "rssi", "signal")
+        return safe_int(v)
 
 
 class KeeneticLteRsrpSensor(_LteSensorBase):
-    """Reference Signal Received Power. -80 great, -100 ok, -120 bad."""
+    """Reference Signal Received Power. -80 great, -110 poor."""
     _attr_icon = "mdi:signal-cellular-outline"
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS_MILLIWATT
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def unique_id(self) -> str:
@@ -291,20 +444,20 @@ class KeeneticLteRsrpSensor(_LteSensorBase):
 
     @property
     def native_value(self) -> int | None:
-        v = self._mobile.get("rsrp")
-        return safe_int(v) if v is not None else None
+        v = _flat_or_nested(self._raw, self._mobile_sub, "rsrp")
+        return safe_int(v)
 
 
 class KeeneticLteRsrqSensor(_LteSensorBase):
-    """Reference Signal Received Quality. -10 great, -20 bad. Unit: dB.
+    """Reference Signal Received Quality (dB ratio).
 
-    Note: not a SIGNAL_STRENGTH device_class because RSRQ is measured
-    in dB (a ratio), not dBm (absolute power). HA's signal-strength
-    icon set still applies via the explicit icon.
+    No SIGNAL_STRENGTH device_class because RSRQ is a ratio in dB,
+    not absolute power in dBm.
     """
     _attr_icon = "mdi:signal-cellular-2"
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def unique_id(self) -> str:
@@ -316,29 +469,142 @@ class KeeneticLteRsrqSensor(_LteSensorBase):
 
     @property
     def native_value(self) -> int | None:
-        v = self._mobile.get("rsrq")
-        return safe_int(v) if v is not None else None
+        v = _flat_or_nested(self._raw, self._mobile_sub, "rsrq")
+        return safe_int(v)
 
 
-class KeeneticLteSinrSensor(_LteSensorBase):
-    """Signal-to-Interference-plus-Noise Ratio. >20 great, <5 bad. dB.
+class KeeneticLteCinrSensor(_LteSensorBase):
+    """Carrier-to-Interference-plus-Noise Ratio (dB).
 
-    Unit is dB (ratio). Same rationale as RSRQ: no SIGNAL_STRENGTH
-    device_class, since that one is tied to dBm.
+    Some firmwares expose this as ``sinr`` (the more common acronym);
+    Marvell-based Keenetic LTE modems report it as ``cinr``. We accept
+    either field name.
     """
     _attr_icon = "mdi:signal-cellular-1"
     _attr_native_unit_of_measurement = SIGNAL_STRENGTH_DECIBELS
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def unique_id(self) -> str:
-        return f"{self._entry_id}_wan_{self._wan_id}_lte_sinr"
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_cinr"
 
     @property
     def name(self) -> str:
-        return "LTE SINR"
+        return "LTE CINR"
 
     @property
     def native_value(self) -> int | None:
-        v = self._mobile.get("sinr") or self._mobile.get("snr")
-        return safe_int(v) if v is not None else None
+        v = _flat_or_nested(self._raw, self._mobile_sub, "cinr", "sinr", "snr")
+        return safe_int(v)
+
+
+class KeeneticLteBandSensor(_LteSensorBase):
+    """Current LTE/5G band (e.g. ``1``, ``B7``)."""
+    _attr_icon = "mdi:radio-tower"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_band"
+
+    @property
+    def name(self) -> str:
+        return "LTE Band"
+
+    @property
+    def native_value(self) -> str | None:
+        v = _flat_or_nested(
+            self._raw, self._mobile_sub,
+            "band", "current-band", "active-band",
+        )
+        return str(v) if v is not None else None
+
+
+class KeeneticLteRoamingSensor(_LteSensorBase):
+    """Whether the SIM is currently roaming (text yes/no for visibility)."""
+    _attr_icon = "mdi:airplane"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_roaming"
+
+    @property
+    def name(self) -> str:
+        return "LTE Roaming"
+
+    @property
+    def native_value(self) -> str | None:
+        v = _flat_or_nested(self._raw, self._mobile_sub, "roaming")
+        if v is None:
+            return None
+        # Surface as text rather than bool — HA renders the latter as
+        # On/Off via switches, but this is a sensor (read-only fact).
+        return "yes" if bool(v) else "no"
+
+
+class KeeneticLteTemperatureSensor(_LteSensorBase):
+    """Modem temperature in Celsius (diagnostic)."""
+    _attr_icon = "mdi:thermometer"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_temperature"
+
+    @property
+    def name(self) -> str:
+        return "LTE Modem Temperature"
+
+    @property
+    def native_value(self) -> float | None:
+        v = _flat_or_nested(self._raw, self._mobile_sub, "temperature")
+        return safe_float(v)
+
+
+class KeeneticLteConnectionStateSensor(_LteSensorBase):
+    """Modem connection state (e.g. ``Connected``, ``Registered``)."""
+    _attr_icon = "mdi:cellphone-link"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_connection_state"
+
+    @property
+    def name(self) -> str:
+        return "LTE Connection State"
+
+    @property
+    def native_value(self) -> str | None:
+        v = _flat_or_nested(
+            self._raw, self._mobile_sub,
+            "connection-state", "registration", "status", "network-status",
+        )
+        return str(v) if v is not None else None
+
+
+class KeeneticLteApnSensor(_LteSensorBase):
+    """Configured APN (e.g. ``internet``)."""
+    _attr_icon = "mdi:earth"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False  # niche, opt-in
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_apn"
+
+    @property
+    def name(self) -> str:
+        return "LTE APN"
+
+    @property
+    def native_value(self) -> str | None:
+        v = _flat_or_nested(self._raw, self._mobile_sub, "apn")
+        if isinstance(v, dict):
+            v = v.get("apn") or v.get("name")
+        return str(v) if v else None
