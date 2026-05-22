@@ -118,6 +118,60 @@
       },
       "wifi_5_temperature": {
         "name": "Sıcaklık 5 GHz"
+      },
+      "lte_data_used": {
+        "name": "Kullanılan Veri"
+      },
+      "lte_data_remaining": {
+        "name": "Kalan Veri"
+      },
+      "lte_data_limit": {
+        "name": "Veri Limiti"
+      },
+      "lte_data_threshold": {
+        "name": "Veri Uyarı Eşiği"
+      },
+      "lte_days_until_reset": {
+        "name": "Sıfırlamaya Kalan Gün"
+      },
+      "lte_quota_usage": {
+        "name": "Kota Kullanımı"
+      },
+      "lte_operator": {
+        "name": "LTE Operatör"
+      },
+      "lte_technology": {
+        "name": "LTE Teknoloji"
+      },
+      "lte_signal_level": {
+        "name": "LTE Sinyal Çubuğu"
+      },
+      "lte_rssi": {
+        "name": "LTE RSSI"
+      },
+      "lte_rsrp": {
+        "name": "LTE RSRP"
+      },
+      "lte_rsrq": {
+        "name": "LTE RSRQ"
+      },
+      "lte_cinr": {
+        "name": "LTE CINR"
+      },
+      "lte_band": {
+        "name": "LTE Bant"
+      },
+      "lte_roaming": {
+        "name": "LTE Dolaşım"
+      },
+      "lte_modem_temperature": {
+        "name": "LTE Modem Sıcaklığı"
+      },
+      "lte_connection_state": {
+        "name": "LTE Bağlantı Durumu"
+      },
+      "lte_apn": {
+        "name": "LTE APN"
       }
     },
     "button": {
@@ -136,6 +190,14 @@
     "number": {
       "bandwidth_limit": {
         "name": "Bant Genişliği Sınırı"
+      }
+    },
+    "binary_sensor": {
+      "data_limit_exceeded": {
+        "name": "Veri Limiti Aşıldı"
+      },
+      "data_threshold_exceeded": {
+        "name": "Veri Eşiği Aşıldı"
       }
     }
   },

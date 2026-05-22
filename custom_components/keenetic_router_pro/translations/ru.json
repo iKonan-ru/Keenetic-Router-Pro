@@ -118,6 +118,60 @@
       },
       "wifi_5_temperature": {
         "name": "Температура 5 ГГц"
+      },
+      "lte_data_used": {
+        "name": "Использовано данных"
+      },
+      "lte_data_remaining": {
+        "name": "Остаток данных"
+      },
+      "lte_data_limit": {
+        "name": "Лимит данных"
+      },
+      "lte_data_threshold": {
+        "name": "Порог данных"
+      },
+      "lte_days_until_reset": {
+        "name": "Дней до сброса"
+      },
+      "lte_quota_usage": {
+        "name": "Использование квоты"
+      },
+      "lte_operator": {
+        "name": "LTE Оператор"
+      },
+      "lte_technology": {
+        "name": "LTE Технология"
+      },
+      "lte_signal_level": {
+        "name": "LTE Уровень сигнала"
+      },
+      "lte_rssi": {
+        "name": "LTE RSSI"
+      },
+      "lte_rsrp": {
+        "name": "LTE RSRP"
+      },
+      "lte_rsrq": {
+        "name": "LTE RSRQ"
+      },
+      "lte_cinr": {
+        "name": "LTE CINR"
+      },
+      "lte_band": {
+        "name": "LTE Диапазон"
+      },
+      "lte_roaming": {
+        "name": "LTE Роуминг"
+      },
+      "lte_modem_temperature": {
+        "name": "LTE Температура модема"
+      },
+      "lte_connection_state": {
+        "name": "LTE Состояние подключения"
+      },
+      "lte_apn": {
+        "name": "LTE APN"
       }
     },
     "button": {
@@ -136,6 +190,14 @@
     "number": {
       "bandwidth_limit": {
         "name": "Лимит пропускной способности"
+      }
+    },
+    "binary_sensor": {
+      "data_limit_exceeded": {
+        "name": "Лимит данных превышен"
+      },
+      "data_threshold_exceeded": {
+        "name": "Порог данных превышен"
       }
     }
   },

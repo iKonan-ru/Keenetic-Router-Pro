@@ -118,6 +118,60 @@
       },
       "wifi_5_temperature": {
         "name": "Temperature 5 GHz"
+      },
+      "lte_data_used": {
+        "name": "Data Used"
+      },
+      "lte_data_remaining": {
+        "name": "Data Remaining"
+      },
+      "lte_data_limit": {
+        "name": "Data Limit"
+      },
+      "lte_data_threshold": {
+        "name": "Data Threshold"
+      },
+      "lte_days_until_reset": {
+        "name": "Days Until Reset"
+      },
+      "lte_quota_usage": {
+        "name": "Quota Usage"
+      },
+      "lte_operator": {
+        "name": "LTE Operator"
+      },
+      "lte_technology": {
+        "name": "LTE Technology"
+      },
+      "lte_signal_level": {
+        "name": "LTE Signal Level"
+      },
+      "lte_rssi": {
+        "name": "LTE RSSI"
+      },
+      "lte_rsrp": {
+        "name": "LTE RSRP"
+      },
+      "lte_rsrq": {
+        "name": "LTE RSRQ"
+      },
+      "lte_cinr": {
+        "name": "LTE CINR"
+      },
+      "lte_band": {
+        "name": "LTE Band"
+      },
+      "lte_roaming": {
+        "name": "LTE Roaming"
+      },
+      "lte_modem_temperature": {
+        "name": "LTE Modem Temperature"
+      },
+      "lte_connection_state": {
+        "name": "LTE Connection State"
+      },
+      "lte_apn": {
+        "name": "LTE APN"
       }
     },
     "button": {
@@ -136,6 +190,14 @@
     "number": {
       "bandwidth_limit": {
         "name": "Bandwidth Limit"
+      }
+    },
+    "binary_sensor": {
+      "data_limit_exceeded": {
+        "name": "Data Limit Exceeded"
+      },
+      "data_threshold_exceeded": {
+        "name": "Data Threshold Exceeded"
       }
     }
   },
