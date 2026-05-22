@@ -45,6 +45,13 @@ async def async_setup_entry(
         known_wan_ids.add(wan_id)
         entities.append(KeeneticWanConnectedSensor(coordinator, entry, wan_id))
         entities.append(KeeneticWanEnabledSensor(coordinator, entry, wan_id))
+        # LTE WANs additionally get two alarm sensors driven by the
+        # router's traffic-counter triggers (issue #47). They surface
+        # only on cellular uplinks — wired WANs never see them — so
+        # this is the right point to gate-add them.
+        if _is_lte_for_binary(wan):
+            entities.append(KeeneticLteLimitExceededSensor(coordinator, entry, wan_id))
+            entities.append(KeeneticLteThresholdExceededSensor(coordinator, entry, wan_id))
 
     # Per-crypto-map binary sensor: "Connected" (phase2 established).
     # Tunnels can be added/removed at runtime via the web UI, so we
@@ -80,6 +87,16 @@ async def async_setup_entry(
             new_entities.append(
                 KeeneticWanEnabledSensor(coordinator, entry, wan_id)
             )
+            # Same LTE-only alarm pair when an LTE stick is hot-plugged
+            # after HA started — keeps the runtime path symmetric with
+            # the initial setup block above.
+            if _is_lte_for_binary(wan):
+                new_entities.append(
+                    KeeneticLteLimitExceededSensor(coordinator, entry, wan_id)
+                )
+                new_entities.append(
+                    KeeneticLteThresholdExceededSensor(coordinator, entry, wan_id)
+                )
         for cmap_name in (coordinator.data.get("crypto_maps") or {}).keys():
             if cmap_name in known_cmap_names:
                 continue
@@ -513,3 +530,106 @@ class KeeneticCryptoMapConnectedSensor(CryptoMapEntity, BinarySensorEntity):
             "via": cmap.get("via"),
             "remote_peer": cmap.get("remote_peer"),
         }
+
+
+# ---------------------------------------------------------------------------
+# LTE traffic-counter alarms (issue #47)
+# ---------------------------------------------------------------------------
+
+
+def _is_lte_for_binary(wan: dict | None) -> bool:
+    """Local LTE detector for the binary_sensor module.
+
+    Mirrors the heuristic in ``sensor/lte.is_lte_wan`` but inlined to
+    avoid pulling the sensor subpackage into binary_sensor's import
+    graph. Both fall back to the trait list as the most stable signal.
+    """
+    if not isinstance(wan, dict):
+        return False
+    raw = wan.get("raw") if isinstance(wan.get("raw"), dict) else {}
+    traits = raw.get("traits") or wan.get("traits") or []
+    if isinstance(traits, list) and ("UsbLte" in traits or "Mobile" in traits):
+        return True
+    iface_id = str(wan.get("id") or "").lower()
+    iface_type = str(wan.get("type") or raw.get("type") or "").lower()
+    if iface_type in ("usblte", "usbmodem", "usbqmi", "usbmodemcdc"):
+        return True
+    if any(tok in iface_id for tok in ("usblte", "usbmodem", "usbqmi")):
+        return True
+    if any(tok in iface_type for tok in ("mobile", "lte", "3g", "4g", "5g")):
+        return True
+    return False
+
+
+class _LteQuotaBinaryBase(WanEntity, BinarySensorEntity):
+    """Shared base for LTE quota-trigger binary sensors.
+
+    Each one tracks one of the booleans the router's traffic-counter
+    fires when the monthly counter crosses the configured warning
+    threshold (`trigger.threshold`) or the hard limit (`trigger.limit`).
+    Both reset automatically on the monthly rollover day, so HA gets a
+    clean off-on-off cycle that's easy to automate against.
+    """
+    _attr_has_entity_name = True
+
+    def _usage(self) -> dict:
+        data = self.coordinator.data or {}
+        m = data.get("lte_data_usage") or {}
+        if not isinstance(m, dict):
+            return {}
+        return m.get(self._wan_id, {}) or {}
+
+    @property
+    def available(self) -> bool:
+        if self._wan is None:
+            return False
+        usage = self._usage()
+        return bool(usage) and usage.get("enabled", False)
+
+
+class KeeneticLteLimitExceededSensor(_LteQuotaBinaryBase):
+    """ON when the monthly data quota has been exceeded.
+
+    Wired to the router's own ``trigger.limit`` flag rather than a
+    locally-computed comparison, so HA's state matches what the
+    router actually thinks — important when the router has its own
+    limit-exceeded action configured (e.g. blink the internet LED).
+    """
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_icon = "mdi:database-alert"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_limit_exceeded"
+
+    @property
+    def name(self) -> str:
+        return "Data Limit Exceeded"
+
+    @property
+    def is_on(self) -> bool | None:
+        usage = self._usage()
+        if not usage:
+            return None
+        return bool(usage.get("limit_exceeded"))
+
+
+class KeeneticLteThresholdExceededSensor(_LteQuotaBinaryBase):
+    """ON when the warning threshold has been crossed (limit not yet hit)."""
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_icon = "mdi:alert"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_wan_{self._wan_id}_lte_threshold_exceeded"
+
+    @property
+    def name(self) -> str:
+        return "Data Threshold Exceeded"
+
+    @property
+    def is_on(self) -> bool | None:
+        usage = self._usage()
+        if not usage:
+            return None
+        return bool(usage.get("threshold_exceeded"))

@@ -35,6 +35,37 @@ RCI_ROOT = "/rci"
 _CLI_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/\-]+$")
 
 
+def _data_usage_to_gb(value: Any, unit: str) -> Optional[float]:
+    """Convert a traffic-counter amount to GB.
+
+    Keenetic surfaces ``value``/``limit``/``threshold``/``remaining``
+    as strings in whatever unit the user picked for that interface's
+    counter (GB on most home setups, but the router accepts KB / MB /
+    TB too). Sensors should always speak GB so HA's long-term
+    statistics and any user-side automations have a single yardstick.
+    Returns None on any parse failure rather than 0 — "unknown" should
+    look different from "zero usage" in the UI.
+    """
+    try:
+        val = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    if val < 0:
+        return None
+    unit_u = (unit or "GB").strip().upper()
+    if unit_u == "GB":
+        return val
+    if unit_u == "MB":
+        return val / 1024.0
+    if unit_u == "KB":
+        return val / (1024.0 * 1024.0)
+    if unit_u in ("B", "BYTES"):
+        return val / (1024.0 * 1024.0 * 1024.0)
+    if unit_u == "TB":
+        return val * 1024.0
+    return val  # unknown unit — pass through, better than dropping the value
+
+
 def _validate_cli_arg(value: str, label: str) -> str:
     """Return a safe Keenetic CLI token or raise on command-injection input.
 
@@ -3042,7 +3073,150 @@ class KeeneticClient:
         await self._rci_parse(cmd)
         await self._rci_parse("system configuration save")
 
+    async def async_get_lte_data_usage(self) -> Dict[str, Dict[str, Any]]:
+        """Get traffic-counter (data usage / monthly quota) for LTE WANs.
+
+        Issue #47: the Keenetic web UI exposes a "Data Usage & Limit"
+        page per cellular interface that shows current usage, the
+        configured limit, the warning threshold and how many days
+        remain until the monthly reset. None of this is derivable
+        from the generic byte counters that ship with every WAN
+        sub-device, so we surface it as a dedicated sensor set.
+
+        Endpoint shape (verified against firmware via the maintainer's
+        router, UsbLte0 on a TurkTelekom plan)::
+
+            GET /rci/show/interface/traffic-counter?name=UsbLte0
+            {
+              "enabled": true,
+              "unit": "GB",
+              "value": "48.659",
+              "threshold": "72.000",
+              "limit": "80.000",
+              "remaining": "31.341",
+              "days-left": 10,
+              "trigger": {"limit": false, "threshold": false},
+              "saved": "Thu May 21 21:33:06 2026"
+            }
+
+        Returns a mapping of interface id to its parsed counter dict.
+        Interfaces without traffic-counter configured, or routers
+        without the feature at all, are absent from the result —
+        callers should treat that as "feature disabled / unsupported"
+        rather than zero usage.
+
+        All numeric strings are converted to GB internally so the
+        downstream sensors always speak a single unit, regardless of
+        whether the router was set to display in MB, GB or TB.
+        """
+        if getattr(self, "_traffic_counter_supported", True) is False:
+            return {}
+
+        # Locate cellular interfaces. We prefer the trait list because
+        # Keenetic firmware traits are stable across versions, but
+        # also accept type-name and id-prefix fallbacks for older
+        # firmwares where the trait array isn't populated.
+        interfaces = await self.async_get_interfaces()
+        if not isinstance(interfaces, dict):
+            return {}
+        iface_dict = interfaces.get("interface", interfaces)
+        if not isinstance(iface_dict, dict):
+            return {}
+
+        lte_ids: list[str] = []
+        for iface_id, iface in iface_dict.items():
+            if not isinstance(iface, dict):
+                continue
+            traits = iface.get("traits") or []
+            iface_type = str(iface.get("type") or "").lower()
+            iface_id_lower = str(iface_id).lower()
+            is_cellular = (
+                "UsbLte" in traits
+                or "Mobile" in traits
+                or "usblte" in iface_type
+                or "usbmodem" in iface_type
+                or "usbqmi" in iface_type
+                or any(tok in iface_id_lower for tok in ("usblte", "usbmodem", "usbqmi"))
+            )
+            if is_cellular:
+                lte_ids.append(str(iface_id))
+
+        if not lte_ids:
+            return {}
+
+        results: Dict[str, Dict[str, Any]] = {}
+        any_endpoint_seen = False
+        for iface_id in lte_ids:
+            try:
+                data = await self._rci_get(
+                    "show/interface/traffic-counter",
+                    params={"name": iface_id},
+                )
+                any_endpoint_seen = True
+            except KeeneticApiError as err:
+                if _is_endpoint_missing(err):
+                    # Per-interface 404 — counter not configured for
+                    # this particular interface (user just hasn't
+                    # turned it on for the second SIM, say). Skip,
+                    # don't disable the feature globally.
+                    _LOGGER.debug(
+                        "traffic-counter not configured for %s — skipping",
+                        iface_id,
+                    )
+                    continue
+                _LOGGER.debug(
+                    "traffic-counter fetch error for %s: %s", iface_id, err
+                )
+                continue
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "traffic-counter fetch error for %s: %s", iface_id, err
+                )
+                continue
+
+            if not isinstance(data, dict) or not data:
+                continue
+            # Disabled-but-present configs return enabled=false; we
+            # still surface the data dict so the user gets a visible
+            # "disabled" state on the binary sensor rather than
+            # silently absent entities.
+            unit = str(data.get("unit") or "GB").upper()
+            normalised: Dict[str, Any] = {
+                "interface_id": iface_id,
+                "enabled": bool(data.get("enabled")),
+                "raw_unit": unit,
+                # All "amount" fields converted to GB so sensors share
+                # a single unit. None passes through as None.
+                "used_gb": _data_usage_to_gb(data.get("value"), unit),
+                "remaining_gb": _data_usage_to_gb(data.get("remaining"), unit),
+                "limit_gb": _data_usage_to_gb(data.get("limit"), unit),
+                "threshold_gb": _data_usage_to_gb(data.get("threshold"), unit),
+                "days_left": safe_int(data.get("days-left")),
+                "limit_exceeded": bool(
+                    (data.get("trigger") or {}).get("limit")
+                ),
+                "threshold_exceeded": bool(
+                    (data.get("trigger") or {}).get("threshold")
+                ),
+                "last_saved": data.get("saved"),
+            }
+            results[iface_id] = normalised
+
+        # If we never even saw a single successful endpoint response
+        # across any LTE interface, the firmware probably doesn't
+        # implement this endpoint at all — cache the capability away
+        # so we stop polling on every coordinator tick.
+        if not any_endpoint_seen and lte_ids:
+            self._traffic_counter_supported = False
+            _LOGGER.debug(
+                "show/interface/traffic-counter endpoint missing on this "
+                "firmware — caching as unsupported"
+            )
+
+        return results
+
     async def async_check_firmware_update(self) -> Dict[str, Any]:
+        """Check for available firmware update via /rci/show/version."""
         """Check for available firmware update via /rci/show/version."""
         try:
             data = await self._rci_get("show/version")

@@ -104,6 +104,7 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             crypto_maps,
             dns_proxy,
             ipsec_diagnostics,
+            lte_data_usage,
         ) = await asyncio.gather(
             _bounded(self.client.async_get_system_info()),
             _bounded(self.client.async_get_current_version_info()),
@@ -130,6 +131,11 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # absent endpoints must not produce per-tick warnings.
             _bounded(self.client.async_get_dns_proxy_status()),
             _bounded(self.client.async_get_ipsec_diagnostics()),
+            # Sprint 12 (issue #47) — LTE data-usage / monthly quota
+            # for cellular WANs. Silent fetch: routers without a
+            # cellular interface return {} and never get re-polled
+            # once the capability cache fires.
+            _bounded(self.client.async_get_lte_data_usage()),
             return_exceptions=True,
         )
  
@@ -143,6 +149,8 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         host_policies = _ok("host_policies", host_policies, {})
         # Silent: routers without traffic-shape component return {}.
         traffic_shapes = _ok("traffic_shapes", traffic_shapes, {}, silent=True)
+        # Silent: most setups don't have a cellular interface.
+        lte_data_usage = _ok("lte_data_usage", lte_data_usage, {}, silent=True)
         ndns_info = _ok("ndns_info", ndns_info, {})
         usb_storage = _ok("usb_storage", usb_storage, [])
         interface_stats = _ok("interface_stats", interface_stats, {})
@@ -510,6 +518,7 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "ndns": ndns_info,
             "host_policies": host_policies,
             "traffic_shapes": traffic_shapes,
+            "lte_data_usage": lte_data_usage,
             "usb_storage": usb_storage,
             "port_info": port_info,
             "mesh_usb": mesh_usb,
