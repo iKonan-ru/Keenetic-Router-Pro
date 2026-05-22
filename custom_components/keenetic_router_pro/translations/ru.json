@@ -123,11 +123,19 @@
     "button": {
       "reboot": {
         "name": "Перезагрузить роутер"
+      },
+      "clear_bandwidth_limit": {
+        "name": "Снять лимит пропускной способности"
       }
     },
     "update": {
       "firmware_update": {
         "name": "Обновление прошивки"
+      }
+    },
+    "number": {
+      "bandwidth_limit": {
+        "name": "Лимит пропускной способности"
       }
     }
   },

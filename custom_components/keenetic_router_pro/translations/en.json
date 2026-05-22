@@ -123,11 +123,19 @@
     "button": {
       "reboot": {
         "name": "Reboot Router"
+      },
+      "clear_bandwidth_limit": {
+        "name": "Clear Bandwidth Limit"
       }
     },
     "update": {
       "firmware_update": {
         "name": "Firmware Update"
+      }
+    },
+    "number": {
+      "bandwidth_limit": {
+        "name": "Bandwidth Limit"
       }
     }
   },

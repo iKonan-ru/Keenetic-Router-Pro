@@ -123,11 +123,19 @@
     "button": {
       "reboot": {
         "name": "Router'ı Yeniden Başlat"
+      },
+      "clear_bandwidth_limit": {
+        "name": "Bant Genişliği Sınırını Kaldır"
       }
     },
     "update": {
       "firmware_update": {
         "name": "Yazılım Güncelleme"
+      }
+    },
+    "number": {
+      "bandwidth_limit": {
+        "name": "Bant Genişliği Sınırı"
       }
     }
   },
