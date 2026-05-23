@@ -1101,11 +1101,15 @@ class KeeneticClient:
             if not ssid and not group:
                 continue
 
-            # Issue #49 fix (extended): skip interfaces already confirmed
-            # missing on a previous tick (e.g. WifiMaster0/AccessPoint1 on
-            # routers without Guest Wi-Fi). Prevents the orphan-AP SSID
-            # inheritance from re-surfacing the phantom interface after the
-            # coordinator cache clears on HA reload.
+            # Issue #49 follow-up: skip interfaces that the function-level
+            # password-fetch cache (``_missing_interface_paths``) already
+            # confirmed don't exist on this router. Without this filter,
+            # Sprint 8's orphan-AP logic (issue #45) can give a phantom
+            # AccessPoint slot the SSID of its real same-group partner —
+            # which then surfaces as an extra QR entity that has no PSK,
+            # because the password lookup short-circuits on the cache.
+            # Filtering at enumeration time keeps the cache's truth from
+            # leaking back into the UI as a confusing duplicate network.
             if raw_id in self._missing_interface_paths:
                 continue
 

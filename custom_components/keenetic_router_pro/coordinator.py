@@ -244,20 +244,13 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         wifi_passwords: dict[str, str] = {}
         if self.data:
             wifi_passwords = dict(self.data.get("wifi_passwords", {}))
-            
-        # Issue #49 fix (coordinator layer): cache "" sentinel for interfaces
-        # where async_get_wifi_password returned None (non-existent APs like
-        # WifiMaster0/AccessPoint1 on routers without Guest Wi-Fi).
-        # Previously only truthy passwords were stored, so a None result was
-        # never cached and the same interface was re-queued every tick,
-        # generating 4-6 router-log errors per 10 seconds indefinitely.
-        # We now store "" as a sentinel meaning "confirmed missing — skip".
+ 
         missing_pw_targets = [
             (net.get("id"), net.get("ssid"))
             for net in wifi
             if net.get("id")
             and net.get("ssid")
-            and net.get("id") not in wifi_passwords  # "" sentinel also excluded
+            and net.get("id") not in wifi_passwords
         ]
         if missing_pw_targets:
             pw_results = await asyncio.gather(
@@ -270,9 +263,8 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for (iface_id, _ssid), pw in zip(missing_pw_targets, pw_results):
                 if isinstance(pw, BaseException):
                     continue
-                # Store the password if found, or "" sentinel so this
-                # interface is permanently skipped on subsequent ticks.
-                wifi_passwords[iface_id] = pw if pw else ""
+                if pw:
+                    wifi_passwords[iface_id] = pw
  
         # ---------- Stage 3b: Mesh USB (parallel per node) ----------
         # Each connected mesh node is queried directly at its own IP
