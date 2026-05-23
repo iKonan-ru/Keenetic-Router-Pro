@@ -783,13 +783,43 @@ class KeeneticClient:
             network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 3 (POST show/interface) response keys: %s",
                          list(data.keys()) if isinstance(data, dict) else type(data))
-            if isinstance(data, dict):
-                # Response might be nested under interface_id or flat
-                iface_data = data.get(interface_id, data)
-                psk = _extract_psk(iface_data)
-                if psk:
-                    _LOGGER.debug("WiFi password found via Method 3 for %s", interface_id)
-                    return psk
+            # Two response shapes are seen across firmware versions:
+            #   1. ``{"<interface_id>": {…fields…}}``  (nested per-interface)
+            #   2. ``{…auth/wpa fields at root…}``     (flat)
+            # A *phantom* interface (no Guest Wi-Fi configured but the
+            # AP slot still listed) produces a third shape: ``{}`` or
+            # the queried key absent entirely. The POST endpoint
+            # itself returns 200 OK in that case, so our ``except``
+            # branch never fires and ``network_methods_missing`` never
+            # ticks — which is exactly the bug that left issue #49's
+            # AccessPoint1 spam unfixed in v1.8.1. We now treat
+            # "endpoint OK but nothing about this interface" as
+            # semantically equivalent to a 404 for cache purposes.
+            psk: str | None = None
+            interface_data_present = False
+            if isinstance(data, dict) and data:
+                nested = data.get(interface_id)
+                if nested:
+                    interface_data_present = True
+                    if isinstance(nested, dict):
+                        psk = _extract_psk(nested)
+                elif any(
+                    k in data
+                    for k in ("authentication", "security-level", "wpa", "key")
+                ):
+                    # Flat form — PSK fields directly on the root.
+                    interface_data_present = True
+                    psk = _extract_psk(data)
+            if psk:
+                _LOGGER.debug("WiFi password found via Method 3 for %s", interface_id)
+                return psk
+            if not interface_data_present:
+                network_methods_missing += 1
+                _LOGGER.debug(
+                    "WiFi password Method 3 returned no data for %s "
+                    "— counting as endpoint-missing",
+                    interface_id,
+                )
         except KeeneticApiError as err:
             network_methods_attempted += 1
             if _is_endpoint_missing(err):
@@ -829,16 +859,48 @@ class KeeneticClient:
             network_methods_attempted += 1
             _LOGGER.debug("WiFi password Method 5 (CLI) response: %s",
                          str(result)[:500] if result else "None")
-            if result:
-                result_str = str(result)
-                for line in result_str.splitlines():
-                    line_lower = line.strip().lower()
-                    if "psk" in line_lower or "key" in line_lower:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            candidate = parts[-1].strip('"').strip("'")
-                            if len(candidate) >= 8:
-                                return candidate
+            # The Keenetic CLI never raises HTTP 404 for unknown
+            # interfaces — it returns a 200 OK body with an "Argument
+            # parse error" string (sometimes "command not found",
+            # sometimes "unknown interface"). Treat any of those as
+            # "this interface doesn't exist" so the cache populator
+            # picks up phantom AccessPoints. Without this gate, Method
+            # 5 quietly inflates ``attempted`` without inflating
+            # ``missing`` and the final check ``missing == attempted``
+            # is always one short. (Same root cause as the Method 3
+            # fix immediately above — different symptom.)
+            method5_missing = False
+            if not result:
+                method5_missing = True
+            else:
+                result_str = str(result).lower()
+                if any(
+                    needle in result_str
+                    for needle in (
+                        "argument parse error",
+                        "command not found",
+                        "unknown interface",
+                        "not found",
+                        "no such",
+                    )
+                ):
+                    method5_missing = True
+                else:
+                    for line in str(result).splitlines():
+                        line_lower = line.strip().lower()
+                        if "psk" in line_lower or "key" in line_lower:
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                candidate = parts[-1].strip('"').strip("'")
+                                if len(candidate) >= 8:
+                                    return candidate
+            if method5_missing:
+                network_methods_missing += 1
+                _LOGGER.debug(
+                    "WiFi password Method 5: CLI rejected interface %s "
+                    "— counting as endpoint-missing",
+                    interface_id,
+                )
         except KeeneticApiError as err:
             network_methods_attempted += 1
             if _is_endpoint_missing(err):
