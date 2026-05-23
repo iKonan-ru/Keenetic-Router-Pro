@@ -1101,6 +1101,14 @@ class KeeneticClient:
             if not ssid and not group:
                 continue
 
+            # Issue #49 fix (extended): skip interfaces already confirmed
+            # missing on a previous tick (e.g. WifiMaster0/AccessPoint1 on
+            # routers without Guest Wi-Fi). Prevents the orphan-AP SSID
+            # inheritance from re-surfacing the phantom interface after the
+            # coordinator cache clears on HA reload.
+            if raw_id in self._missing_interface_paths:
+                continue
+
             clone = dict(item)
             clone["__id"] = raw_id
             ap_items.append(clone)
