@@ -61,7 +61,8 @@ from .mesh import (
     KeeneticMeshClientsSensor,
     KeeneticMeshFirmwareVersionSensor,
     KeeneticMeshLocalIpSensor,
-    KeeneticMeshPortSensor
+    KeeneticMeshPortSensor,
+    KeeneticMeshPortSpeedSensor,
 )
 from .traffic import (
     KeeneticLanRxSensor,
@@ -204,6 +205,14 @@ async def async_setup_entry(
                 port_label = port.get("label")
                 if port_label is not None:
                     entities.append(KeeneticMeshPortSensor(coordinator, entry, node_cid, port_label))
+                    # New companion: numeric link-speed sensor, parallel
+                    # to the controller-side KeeneticPortSpeedSensor.
+                    # Disabled by default (see class docstring) — mesh
+                    # nodes often have several rear ports and most
+                    # users only care about one or two. Diagnostic
+                    # category + opt-in keeps the entity registry
+                    # clean while still being discoverable.
+                    entities.append(KeeneticMeshPortSpeedSensor(coordinator, entry, node_cid, port_label))
 
     # WireGuard profilleri için sensörler
     wg_profiles = coordinator.data.get("wireguard", {}).get("profiles", {})

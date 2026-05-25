@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTime, EntityCategory
+from homeassistant.const import UnitOfDataRate, UnitOfTime, EntityCategory
 
 from ..coordinator import KeeneticCoordinator
 from ..entity import ControllerEntity, MeshEntity
@@ -399,3 +403,94 @@ class KeeneticMeshPortSensor(MeshEntity, SensorEntity):
                 return attrs
 
         return None
+
+class KeeneticMeshPortSpeedSensor(MeshEntity, SensorEntity):
+    """Negotiated link speed for a mesh-node physical port.
+
+    Mirrors ``KeeneticPortSpeedSensor`` (introduced as a controller-side
+    sensor) for each mesh extender's ports. Exposed as a separate
+    numeric entity from the existing combined ``KeeneticMeshPortSensor``
+    so HA's long-term statistics can graph negotiated speed cleanly
+    over time (the combined sensor's state is a string like "up",
+    which statistics can't aggregate).
+
+    The "available" property is wired to the port's link state — when
+    a cable is unplugged the entity goes ``unavailable`` rather than
+    reporting 0 Mbps, which keeps the statistics history honest.
+    """
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.DATA_RATE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfDataRate.MEGABITS_PER_SECOND
+    _attr_icon = "mdi:speedometer"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_suggested_display_precision = 0
+    # NOTE: enabled-by-default, mirroring the controller-side
+    # ``KeeneticPortSpeedSensor``. An earlier draft of this class
+    # hid mesh-node port speeds in the disabled list to keep the
+    # entity registry tidy on multi-port extenders, but that broke
+    # the user expectation that "if my main router shows speed for
+    # each port, so should each mesh node". Symmetry beats tidiness
+    # here — users who don't want every port can still disable the
+    # ones they don't care about individually.
+
+    def __init__(
+        self,
+        coordinator: KeeneticCoordinator,
+        entry: ConfigEntry,
+        node_cid: str,
+        port_label: str,
+    ) -> None:
+        MeshEntity.__init__(self, coordinator, entry.entry_id, entry.title, node_cid)
+        self._port_label = port_label
+
+    @property
+    def name(self) -> str:
+        return f"Port {self._port_label} Speed"
+
+    @property
+    def unique_id(self) -> str:
+        # Match the existing mesh port-state sensor's id-shaping so
+        # nothing accidentally collides on routers whose CID has
+        # colons / hyphens in it.
+        safe_cid = self._node_cid.replace("-", "_").replace(":", "_")[:16]
+        return f"{safe_cid}_port_{self._port_label}_speed"
+
+    def _port_data(self) -> dict[str, Any] | None:
+        node = self._node
+        if not node:
+            return None
+        for port in node.get("port", []) or []:
+            if port.get("label") == self._port_label:
+                return port
+        return None
+
+    @property
+    def available(self) -> bool:
+        if not super().available:
+            return False
+        port = self._port_data()
+        return port is not None and port.get("link") == "up"
+
+    @property
+    def native_value(self) -> float | None:
+        port = self._port_data()
+        if port is None or port.get("link") != "up":
+            return None
+        speed = port.get("speed")
+        if speed is None:
+            return None
+        try:
+            return float(speed)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        port = self._port_data()
+        if not port:
+            return None
+        return {
+            "duplex": port.get("duplex"),
+            "link": port.get("link"),
+        }
