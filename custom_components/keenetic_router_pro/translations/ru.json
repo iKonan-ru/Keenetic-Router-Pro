@@ -199,6 +199,11 @@
       "data_threshold_exceeded": {
         "name": "Порог данных превышен"
       }
+    },
+    "select": {
+      "sim_slot": {
+        "name": "Слот SIM"
+      }
     }
   },
   "issues": {

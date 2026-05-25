@@ -199,6 +199,11 @@
       "data_threshold_exceeded": {
         "name": "Veri Eşiği Aşıldı"
       }
+    },
+    "select": {
+      "sim_slot": {
+        "name": "SIM Yuvası"
+      }
     }
   },
   "issues": {
