@@ -3289,6 +3289,112 @@ class KeeneticClient:
 
         return results
 
+    async def async_get_lte_sim_slots(self) -> Dict[str, int]:
+        """Return the currently configured SIM slot per cellular interface.
+
+        Important quirk that took a round-trip to discover: ``sim``
+        means two different things on two different endpoints.
+
+        * ``/rci/show/interface/<id>`` — the status view returns
+          ``sim: "READY"`` (or ``"ABSENT"``, ``"PIN_REQUIRED"`` etc.),
+          a *string* describing the SIM card's readiness state.
+        * ``/rci/interface/<id>`` — the *running config* view returns
+          ``sim: {"slot": N}``, the *integer* slot the router is
+          configured to talk to.
+
+        We need the second form for the slot dropdown. Issue #51.
+
+        Returns a mapping of interface id to the integer slot
+        (1 or 2). Interfaces that don't have an explicit slot
+        configured fall back to absent in the dict — the select
+        entity then renders as "Unknown" rather than guessing
+        a default that might be wrong for dual-SIM modems.
+        """
+        # Build the list of cellular interfaces from the cached
+        # status data we already fetch every tick. Routers without
+        # any LTE/USB modem return an empty list and the function
+        # short-circuits without making per-interface config calls.
+        interfaces = await self.async_get_interfaces()
+        if not isinstance(interfaces, dict):
+            return {}
+        iface_dict = interfaces.get("interface", interfaces)
+        if not isinstance(iface_dict, dict):
+            return {}
+
+        lte_ids: list[str] = []
+        for iface_id, iface in iface_dict.items():
+            if not isinstance(iface, dict):
+                continue
+            traits = iface.get("traits") or []
+            iface_type = str(iface.get("type") or "").lower()
+            iface_id_lower = str(iface_id).lower()
+            is_cellular = (
+                "UsbLte" in traits
+                or "Mobile" in traits
+                or "usblte" in iface_type
+                or "usbmodem" in iface_type
+                or "usbqmi" in iface_type
+                or any(tok in iface_id_lower for tok in ("usblte", "usbmodem", "usbqmi"))
+            )
+            if is_cellular:
+                lte_ids.append(str(iface_id))
+
+        if not lte_ids:
+            return {}
+
+        results: Dict[str, int] = {}
+        for iface_id in lte_ids:
+            try:
+                cfg = await self._rci_get(f"interface/{iface_id}")
+            except KeeneticApiError as err:
+                _LOGGER.debug(
+                    "SIM-slot config fetch failed for %s: %s", iface_id, err
+                )
+                continue
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "SIM-slot config fetch failed for %s: %s", iface_id, err
+                )
+                continue
+
+            if not isinstance(cfg, dict):
+                continue
+            sim_cfg = cfg.get("sim")
+            if not isinstance(sim_cfg, dict):
+                continue
+            slot = safe_int(sim_cfg.get("slot"))
+            if slot is not None:
+                results[iface_id] = slot
+
+        return results
+
+    async def async_set_sim_slot(self, interface_id: str, slot: int) -> None:
+        """Switch the configured SIM slot on a cellular interface.
+
+        Implements issue #51. Confirmed CLI flow against the
+        reporter's UsbQmi0 (Keenetic Giga III, dual-SIM modem):
+
+        1. ``interface <id> sim slot <N>`` — router prints
+           ``"<id>": SIM slot is set to "N"`` and the change is
+           applied immediately on the live config.
+        2. ``system configuration save`` — persists across reboots,
+           same pattern as the policy / bandwidth-limit selectors.
+
+        The modem auto-reconnects after the switch (verified via
+        ``uptime`` counter restart and ``connected: yes`` in the
+        status view), so we don't need to bounce the interface
+        down/up manually. A coordinator refresh request after the
+        set call is enough to reflect the new slot in HA.
+        """
+        if slot not in (1, 2):
+            raise ValueError(f"SIM slot must be 1 or 2, got {slot}")
+        safe_id = _validate_cli_arg(interface_id, "interface id")
+        _LOGGER.debug(
+            "Switching SIM slot on interface %s to %d", interface_id, slot
+        )
+        await self._rci_parse(f"interface {safe_id} sim slot {slot}")
+        await self._rci_parse("system configuration save")
+
     async def async_check_firmware_update(self) -> Dict[str, Any]:
         """Check for available firmware update via /rci/show/version."""
         """Check for available firmware update via /rci/show/version."""
