@@ -10,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import KeeneticClient, KeeneticAuthError, KeeneticApiError
@@ -229,6 +230,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
 
     coordinator.async_add_listener(_async_handle_new_device)
+
+    # One-shot migration for v1.12.0 → v1.12.x upgraders.
+    #
+    # v1.12.0 shipped the new ``KeeneticMeshPortSpeedSensor`` with
+    # ``_attr_entity_registry_enabled_default = False``, intending to
+    # keep the entity registry tidy on multi-port mesh extenders.
+    # That decision broke the symmetry with the controller-side
+    # port-speed sensor (which was enabled by default) and confused
+    # users who expected one speed entity per port across all devices.
+    # v1.12.1 flipped the default back to enabled, but Home Assistant
+    # only honours ``enabled_default`` when an entity is *first*
+    # registered — entities already in the registry keep their
+    # "disabled-by-integration" flag and stay invisible on the
+    # dashboard until manually re-enabled. That's a registry-level
+    # quirk we have to repair in code; users won't (and shouldn't
+    # have to) walk through 4-12 disabled entities clicking Enable.
+    #
+    # We only flip entities that we ourselves disabled
+    # (``RegistryEntryDisabler.INTEGRATION``) — never user choices.
+    # Pattern is the port-speed unique_id shape used by both the
+    # controller and mesh classes: ends with ``_speed`` and contains
+    # ``_port_``. Future port-speed-shaped entities added by the
+    # integration will also benefit if anyone ever ships them with
+    # the wrong default again; the cost is negligible since the loop
+    # runs once at setup and only touches matching entries.
+    try:
+        ent_reg = er.async_get(hass)
+        for ent in list(ent_reg.entities.values()):
+            if ent.config_entry_id != entry.entry_id:
+                continue
+            if ent.disabled_by != er.RegistryEntryDisabler.INTEGRATION:
+                continue
+            uid = ent.unique_id or ""
+            if not uid.endswith("_speed") or "_port_" not in uid:
+                continue
+            ent_reg.async_update_entity(ent.entity_id, disabled_by=None)
+            _LOGGER.info(
+                "Re-enabled %s (was disabled by v1.12.0's wrong default)",
+                ent.entity_id,
+            )
+    except Exception:  # noqa: BLE001
+        # Migration is best-effort. If HA changes its registry API
+        # shape on us, swallowing here keeps setup itself working;
+        # affected users can still re-enable manually.
+        _LOGGER.exception(
+            "Port-speed entity re-enable migration failed — entities "
+            "may need manual enabling in Settings → Entities"
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
