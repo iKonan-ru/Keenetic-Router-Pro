@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.const import (
     CONF_HOST,
     CONF_PORT,
@@ -121,6 +121,24 @@ class KeeneticRouterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     user_input[CONF_HOST] = self._discovered_host
                     _LOGGER.debug("Using discovered host: %s", user_input[CONF_HOST])
 
+                # Defensive host normalisation — strip the most common
+                # paste-mistakes users make when setting up KeenDNS
+                # (issue #43). The Host field is documented as a plain
+                # hostname or IP, but users naturally paste full URLs
+                # like ``https://<name>.keenetic.pro/`` which would
+                # otherwise produce the malformed
+                # ``http://https://<name>.keenetic.pro:443/rci/...``
+                # and a confusing 401. We do this *before* handing the
+                # value to KeeneticClient so the downstream client and
+                # the stored config entry both see the clean form.
+                raw_host = str(user_input.get(CONF_HOST) or "").strip()
+                for prefix in ("https://", "http://"):
+                    if raw_host.lower().startswith(prefix):
+                        raw_host = raw_host[len(prefix):]
+                raw_host = raw_host.rstrip("/").strip()
+                if raw_host:
+                    user_input[CONF_HOST] = raw_host
+
                 session = async_get_clientsession(self.hass)
                 client = KeeneticClient(
                     host=user_input[CONF_HOST],
@@ -208,6 +226,16 @@ class KeeneticRouterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except KeeneticApiError as err:
                 _LOGGER.error("API/connection error: %s", err)
                 errors["base"] = "cannot_connect"
+            except data_entry_flow.AbortFlow:
+                # HA's expected control-flow signal for "this device is
+                # already configured" / "user reauth-completed" / similar.
+                # Without this explicit re-raise, the generic Exception
+                # handler below swallows the AbortFlow and reports it
+                # as a scary "Unknown error" — most visibly when a user
+                # tries to add the same router twice (e.g. once via LAN
+                # and once via KeenDNS to test that auth path works).
+                # Issue #43 follow-up.
+                raise
             except Exception as err:
                 _LOGGER.exception("Unexpected error during setup: %s", err)
                 errors["base"] = "unknown"
