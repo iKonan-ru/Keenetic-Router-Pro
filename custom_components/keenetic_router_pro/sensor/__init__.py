@@ -26,6 +26,7 @@ from .network import (
     KeeneticActiveConnectionsSensor,
     KeeneticLocalIpSensor,
     KeeneticMainPortSensor,
+    KeeneticPortSpeedSensor,
     KeeneticWanProviderSensor,
     KeeneticWanRoleSensor,
     KeeneticWanInterfaceSensor,
@@ -180,6 +181,7 @@ async def async_setup_entry(
         port_label = port.get("label")
         if port_label is not None:
             entities.append(KeeneticMainPortSensor(coordinator, entry, port_label))
+            entities.append(KeeneticPortSpeedSensor(coordinator, entry, port_label))
 
     # Mesh система
     entities.append(KeeneticMeshSystemStateSensor(coordinator, entry))

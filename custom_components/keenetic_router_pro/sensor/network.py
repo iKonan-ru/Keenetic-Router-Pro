@@ -256,6 +256,74 @@ class KeeneticMainPortSensor(ControllerEntity, SensorEntity):
                 return attrs
         return None
 
+
+class KeeneticPortSpeedSensor(ControllerEntity, SensorEntity):
+    """Negotiated link speed for a physical port (10 / 100 / 1000 Mbps)."""
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.DATA_RATE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfDataRate.MEGABITS_PER_SECOND
+    _attr_icon = "mdi:speedometer"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        coordinator: KeeneticCoordinator,
+        entry: ConfigEntry,
+        port_label: str,
+    ) -> None:
+        ControllerEntity.__init__(self, coordinator, entry.entry_id, entry.title)
+        self._port_label = port_label
+
+    @property
+    def name(self) -> str:
+        return f"Port {self._port_label} Speed"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry_id}_port_{self._port_label}_speed"
+
+    def _port_data(self) -> dict[str, Any] | None:
+        """Return the port dict for this label, or None if not found."""
+        for port in self.coordinator.data.get("port_info", []) or []:
+            if port.get("label") == self._port_label:
+                return port
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Only available when coordinator is running AND port link is up."""
+        if not super().available:
+            return False
+        port = self._port_data()
+        return port is not None and port.get("link") == "up"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return negotiated link speed in Mbps, or None when link is down."""
+        port = self._port_data()
+        if port is None or port.get("link") != "up":
+            return None
+        speed = port.get("speed")
+        if speed is None:
+            return None
+        try:
+            return float(speed)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        port = self._port_data()
+        if not port:
+            return None
+        return {
+            "duplex": port.get("duplex"),
+            "link": port.get("link"),
+        }
+
+
 # =============================================================================
 # Per-WAN interface sensors
 #
