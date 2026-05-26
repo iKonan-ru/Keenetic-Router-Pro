@@ -270,8 +270,11 @@ class KeeneticCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for (iface_id, _ssid), pw in zip(missing_pw_targets, pw_results):
                 if isinstance(pw, BaseException):
                     continue
-                if pw:
-                    wifi_passwords[iface_id] = pw
+                # Store the password if found, or "" sentinel so this
+                # interface is permanently skipped on subsequent ticks.
+                # Without this, None (returned for non-existent APs like
+                # AccessPoint1) is never cached and re-queued every tick.
+                wifi_passwords[iface_id] = pw if pw else ""
  
         # ---------- Stage 3b: Mesh USB (parallel per node) ----------
         # Each connected mesh node is queried directly at its own IP
