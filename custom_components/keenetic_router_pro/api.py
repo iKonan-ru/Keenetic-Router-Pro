@@ -2584,9 +2584,18 @@ class KeeneticClient:
             if not iface_name:
                 continue
 
-            # Пропускаем внутренние интерфейсы (Bridge, Vlan, AccessPoint)
+            # Пропускаем внутренние интерфейсы (Bridge, Vlan, AccessPoint),
+            # НО никогда не пропускаем uplink: VLAN-WAN — обычное дело
+            # (провайдер раздаёт интернет через тегированный VLAN). См. #56.
             iface_type = iface.get("type", "").lower()
-            if iface_type in ("bridge", "vlan", "accesspoint"):
+            role = iface.get("role")
+            is_uplink = (
+                (isinstance(role, list)
+                 and any(str(r).lower() in ("inet", "internet", "wan") for r in role))
+                or (isinstance(role, str) and role.lower() in ("inet", "internet", "wan"))
+                or (bool(iface.get("global")) and iface.get("priority") is not None)
+            )
+            if iface_type in ("bridge", "vlan", "accesspoint") and not is_uplink:
                 continue
 
             try:
